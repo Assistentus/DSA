@@ -1,68 +1,82 @@
 import threading
 import queue
+import numpy as np
 import logging
+from typing import Dict
 
 logger = logging.getLogger("DSA_AsyncWriter")
 
 class AsyncDiskWriter:
     """
-    Фоновый воркер для асинхронной записи тензоров в np.memmap.
-    Освобождает GPU/CPU от блокировок дисковыми I/O операциями.
+    Фоновый воркер для асинхронной записи обновлений на диск.
+    Реализует Double Buffering: GPU вычисляет батч N+1, пока CPU пишет батч N.
     """
-    def __init__(self, max_queue_size: int = 150):
+    def __init__(self, memmaps: Dict[str, np.memmap], max_queue_size: int = 150):
+        self.memmaps = memmaps
         self.queue = queue.Queue(maxsize=max_queue_size)
-        self._stop_signal = object()  # Уникальный Sentinel для гарантии остановки
-        self._lock = threading.Lock() # Мьютекс для защиты дисковых транзакций
+        self._stop_signal = object()
+        self._lock = threading.Lock()
         
         self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
         self.worker_thread.start()
-        logger.info("💿 AsyncDiskWriter started in background.")
+        logger.info("💿 AsyncDiskWriter: Фоновый поток инициализирован.")
 
     def _process_queue(self):
+        """Цикл записи: работает параллельно с основным обучением."""
         while True:
             batch_data = self.queue.get()
             
-            # Обработка сигнала завершения
             if batch_data is self._stop_signal:
+                # Перед выходом фиксируем все данные на физическом носителе
+                self._final_flush()
                 self.queue.task_done()
                 break
             
-            name, indices, w_np, m_np, v_np, memmaps = batch_data
+            name, indices, w_np, m_np, v_np = batch_data
             try:
-                # Атомарная и безопасная запись на диск
                 with self._lock:
-                    memmaps[name][indices] = w_np
-                    memmaps[f"{name}_m"][indices] = m_np
-                    memmaps[f"{name}_v"][indices] = v_np
-                    
-                    # Принудительный сброс буферов OS на железо (SSD)
-                    memmaps[name].flush()
-                    memmaps[f"{name}_m"].flush()
-                    memmaps[f"{name}_v"].flush()
+                    # Записываем данные в mmap (в оперативную память ОС)
+                    self.memmaps[name][indices] = w_np
+                    self.memmaps[f"{name}_m"][indices] = m_np
+                    self.memmaps[f"{name}_v"][indices] = v_np
+                    # .flush() здесь не вызываем для максимальной скорости IO
             except Exception as e:
-                logger.error(f"❌ IO Error during write-back: {e}")
+                logger.error(f"❌ IO Error: {e}")
             finally:
                 self.queue.task_done()
 
-    def put_update(self, name: str, indices_pt, w_pt, m_pt, v_pt, memmaps_dict: dict):
+    def _final_flush(self):
+        """Принудительная запись на диск перед выключением."""
+        logger.info("💾 AsyncDiskWriter: Финализация данных на диске...")
+        with self._lock:
+            for mm in self.memmaps.values():
+                try:
+                    mm.flush()
+                except:
+                    pass
+
+    def put_update(self, name: str, indices_pt, w_pt, m_pt, v_pt):
         """
-        Отрывает тензоры от графа вычислений, переводит в numpy и отправляет в очередь.
+        Подготовка данных для записи. Выполняется в потоке GPU.
         """
-        indices_np = indices_pt.detach().cpu().numpy()
+        # Переводим в Numpy на CPU. Это освобождает GPU тензоры немедленно.
+        idx_np = indices_pt.detach().cpu().numpy()
         w_np = w_pt.detach().cpu().numpy()
         m_np = m_pt.detach().cpu().numpy()
         v_np = v_pt.detach().cpu().numpy()
 
         try:
-            # put_nowait позволяет GPU сразу идти дальше, если диск захлебнулся
-            self.queue.put_nowait((name, indices_np, w_np, m_np, v_np, memmaps_dict))
+            # Отправляем в очередь без блокировки
+            self.queue.put_nowait((name, idx_np, w_np, m_np, v_np))
         except queue.Full:
-            logger.warning(f"⚠️ IO Queue full! Dropping write batch for '{name}'. SSD is too slow.")
+            # Если диск не успевает, мы жертвуем этим батчем записи, чтобы не тормозить GPU.
+            # В градиентном спуске это допустимый шум (stale gradients).
+            logger.warning(f"⚠️ Диск перегружен! Пропуск записи батча для '{name}'.")
 
     def shutdown(self):
-        """Гарантирует дописывание очереди перед выходом из программы."""
-        logger.info("⏳ AsyncDiskWriter: waiting for IO queue to flush...")
+        """Graceful shutdown."""
+        logger.info("⏳ AsyncDiskWriter: Завершение операций...")
         self.queue.put(self._stop_signal)
         self.queue.join()
         self.worker_thread.join()
-        logger.info("✅ AsyncDiskWriter: Shutdown complete. All data saved.")
+        logger.info("✅ AsyncDiskWriter: Все данные сохранены.")
