@@ -38,7 +38,7 @@ pip install disk-sparse-adam
 ```python
 import torch
 import numpy as np
-from disk_optim import DiskSparseAdam
+from dsa import DiskSparseRiemannianAdam
 
 # 1. Initialize embeddings directly on disk
 num_nodes, dim = 10_000_000, 1024
@@ -47,7 +47,7 @@ weights_disk = np.memmap(
 )
 
 # 2. Initialize optimizer
-optimizer = DiskSparseAdam(
+optimizer = DiskSparseRiemannianAdam(
     cache_dir="./cache",
     params_dict={"graph_nodes": weights_disk},
     lr=0.001,
