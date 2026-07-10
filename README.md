@@ -2,7 +2,7 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-green.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21296366.svg)(https://doi.org/10.5281/zenodo.21296366)]
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21296366.svg)](https://doi.org/10.5281/zenodo.21296366)
 
 An out-of-core Sparse Adam optimizer for PyTorch, designed to train large-scale Graph Neural Networks (GNNs) and Knowledge Graph Embeddings (KGE) on consumer-grade GPUs.
 
