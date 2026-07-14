@@ -5,7 +5,7 @@
 <a href="https://doi.org/10.5281/zenodo.21296366"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.21296366.svg" alt="DOI"></a>
 
 
-An out-of-core Sparse Adam optimizer for PyTorch, designed to train large-scale Graph Neural Networks (GNNs) and Knowledge Graph Embeddings (KGE) on consumer-grade GPUs.
+Reduce optimizer memory from O(N) to O(B) and train billion-scale embeddings without distributed infrastructure. Train graphs with 10M–100M+ nodes on a single consumer GPU by moving Adam optimizer states from VRAM to NVMe SSD.
 
 ## Problem
 
