@@ -1,7 +1,7 @@
 # DiskSparseAdam
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-green.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 <a href="https://doi.org/10.5281/zenodo.21296366"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.21296366.svg" alt="DOI"></a>
 
 
