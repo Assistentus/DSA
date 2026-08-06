@@ -36,7 +36,8 @@ class AsyncDiskWriter:
             try:
                 with self._lock:
                     # Записываем данные в mmap (в оперативную память ОС)
-                    self.memmaps[name][indices] = w_np
+                    # ИСПРАВЛЕНО: Добавлен суффикс _w для совпадения с ключами из optimizer.py
+                    self.memmaps[f"{name}_w"][indices] = w_np
                     self.memmaps[f"{name}_m"][indices] = m_np
                     self.memmaps[f"{name}_v"][indices] = v_np
                     # .flush() здесь не вызываем для максимальной скорости IO
