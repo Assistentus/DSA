@@ -133,6 +133,9 @@ In a **Kaggle Notebook**, VRAM and RAM are strictly capped (~15 GB VRAM, ~13–3
 ```
 
 ### Full Kaggle Notebook Integration Code
+
+👉 **Interactive Kaggle Demo:** [DiskSparseAdam Kaggle Notebook](https://www.kaggle.com/code/assistentus/disksparseadam-dsa)
+
 ```python
 import os
 import shutil
