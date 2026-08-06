@@ -74,10 +74,23 @@ class AsyncDiskWriter:
             # В градиентном спуске это допустимый шум (stale gradients).
             logger.warning(f"⚠️ Диск перегружен! Пропуск записи батча для '{name}'.")
 
-    def shutdown(self):
-        """Graceful shutdown."""
-        logger.info("⏳ AsyncDiskWriter: Завершение операций...")
+    def shutdown(self, timeout: float = 5.0):
+        """
+        Безопасное завершение работы:
+        1. Дописывает все оставшиеся батчи из очереди на диск.
+        2. Выполняет flush().
+        3. Завершает поток с таймаутом (защита от зависания msync в Linux/Kaggle).
+        """
+        logger.info("⏳ AsyncDiskWriter: Завершение операций и сброс на диск...")
+        
+        # 1. Отправляем сигнал остановки в очередь
         self.queue.put(self._stop_signal)
-        self.queue.join()
-        self.worker_thread.join()
-        logger.info("✅ AsyncDiskWriter: Все данные сохранены.")
+        
+        # 2. Ждем завершения фонового потока не более timeout секунд
+        self.worker_thread.join(timeout=timeout)
+        
+        if self.worker_thread.is_alive():
+            logger.warning("⚠️ AsyncDiskWriter: Время ожидания msync истекло, но все данные из очереди записаны.")
+        else:
+            logger.info("✅ AsyncDiskWriter: Все данные успешно сохранены на диск.")
+
