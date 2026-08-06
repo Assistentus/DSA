@@ -6,9 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 <a href="https://doi.org/10.5281/zenodo.21296366"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.21296366.svg" alt="DOI"></a>
 
-<p align="center">
-  <img src="assets/banner.png" alt="DiskSparseAdam Banner" width="100%">
-</p>
+
 
 **DiskSparseAdam (DSA)** is a drop-in Out-of-Core Sparse Adam optimizer for PyTorch. It reduces optimizer memory footprint from $\mathcal{O}(N)$ to $\mathcal{O}(B)$, enabling the training of billion-scale graph embeddings and Knowledge Graph representations on **consumer-grade GPUs and workstations**, as well as cloud environments like **Kaggle** and **Google Colab**.
 
