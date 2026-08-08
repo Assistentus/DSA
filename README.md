@@ -35,6 +35,7 @@ Tested on a dataset of **1,000,000 entities** (128-dim vectors, ~1.46 GB total s
 | **Convergence** | Verified Loss reduction on synthetic & real graph tasks |
 | **Duplicate Nodes** | Safe automatic aggregation via `index_add_` |
 
+[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue?style=for-the-badge)](https://huggingface.co/spaces/ВАШ_USERNAME/dsa-memory-benchmark)
 ---
 
 ## 📦 Installation
