@@ -294,7 +294,7 @@ SOFTWARE.
 If you use this software in your research, please cite it using the following DOI:
 
 **APA:**
-> Khotinsky, M. (2024). DiskSparseAdam (DSA): Out-of-Core Sparse Adam Optimizer. Zenodo. https://doi.org/10.5281/zenodo.21296366
+> Khotinsky, M. (2026). DiskSparseAdam (DSA): Out-of-Core Sparse Adam Optimizer. Zenodo. https://doi.org/10.5281/zenodo.21296366
 
 **BibTeX:**
 ```bibtex
