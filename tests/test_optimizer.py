@@ -27,26 +27,21 @@ def test_dsa_euclidean_step():
         )
         
         initial_w0 = optimizer.state_files["entity_emb"]["w"][0].copy()
-        
         batch_indices = torch.tensor([0, 1, 2, 3], dtype=torch.long)
         idx_np = batch_indices.numpy()
         
         for _ in range(5):
             weights_np = optimizer.state_files["entity_emb"]["w"][idx_np].copy()
             current_weights = torch.from_numpy(weights_np).requires_grad_(True)
-            
             loss = torch.mean(current_weights ** 2)
             loss.backward()
-            
             optimizer.step(updates={"entity_emb": (batch_indices, current_weights.grad.cpu())})
-        
-        optimizer.shutdown(timeout=2.0)
+        optimizer.shutdown()
         
         updated_w0 = optimizer.state_files["entity_emb"]["w"][0].copy()
         assert not np.array_equal(initial_w0, updated_w0), "Веса на диске должны были обновиться!"
         
     finally:
-
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -64,7 +59,7 @@ def test_dsa_hyperbolic_step():
         optimizer = DiskSparseRiemannianAdam(
             params={"entity_emb": initial_embeddings},
             lr=0.01,
-            k=1.0,
+            k=1.0, 
             disk_dir=temp_dir,
             max_queue_size=50
         )
@@ -79,7 +74,7 @@ def test_dsa_hyperbolic_step():
         loss.backward()
         
         optimizer.step(updates={"entity_emb": (batch_indices, current_weights.grad.cpu())})
-        optimizer.shutdown(timeout=2.0)
+        optimizer.shutdown()
         
     finally:
         if os.path.exists(temp_dir):
