@@ -15,10 +15,15 @@ class DiskSparseRiemannianAdam(Optimizer):
     - Масштабирует использование памяти от размера батча O(B), а не графа O(N).
     - Реализует Riemannian Gradient Scaling и проекцию (Retraction) для шара Пуанкаре.
     - Использует фоновую асинхронную запись для устранения простоев GPU.
+
+    Гарантии корректности (F1, F2 — см. CHANGELOG.md): записи никогда не
+    выбрасываются при полной очереди; step() не читает строки, находящиеся
+    в полёте у писателя, без дрена очереди.
     """
     
     def __init__(self, params: Union[list, dict], lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8,
-                 weight_decay=0, k=1.0, disk_dir="./disk_cache", max_queue_size=150):
+                 weight_decay=0, k=1.0, disk_dir="./disk_cache", max_queue_size=150,
+                 put_timeout: float = 5.0):
         
         if isinstance(params, dict):
             self.param_names = list(params.keys())
@@ -69,7 +74,8 @@ class DiskSparseRiemannianAdam(Optimizer):
         # Запуск фонового писателя
         self.writer = AsyncDiskWriter(
             memmaps={f"{n}_{s}": self.state_files[n][s] for n in self.param_names for s in ['w', 'm', 'v']},
-            max_queue_size=max_queue_size
+            max_queue_size=max_queue_size,
+            put_timeout=put_timeout
         )
 
     @torch.no_grad()
@@ -111,6 +117,12 @@ class DiskSparseRiemannianAdam(Optimizer):
 
             idx_np = active_indices.cpu().numpy()
             states = self.state_files[name]
+
+            # F2: не читать строки, которые писатель ещё не дописал.
+            # Пересечение пусто → читаем сразу (асинхронность сохраняется);
+            # непусто → ждём полной очистки очереди и только потом читаем.
+            if self.writer.intersects_inflight(name, idx_np):
+                self.writer.wait_all_flushed()
             
             # 2. Чтение из mmap в оперативную память (только нужные строки)
             w = torch.from_numpy(states['w'][idx_np].copy())
