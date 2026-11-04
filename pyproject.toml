@@ -4,9 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsa"
-version = "0.1.0"
+version = "0.2.0"
 description = "Disk Sparse Adam (DSA): An Out-of-Core Sparse Adam optimizer for PyTorch"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.8"
 authors = [
     { name = "Maksim Khotinsky" }
@@ -19,3 +21,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/Assistentus/DSA"
 Repository = "https://github.com/Assistentus/DSA"
+Changelog = "https://github.com/Assistentus/DSA/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["dsa"]
