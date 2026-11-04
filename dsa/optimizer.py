@@ -17,12 +17,20 @@ logger = logging.getLogger("DSA")
 STATE_FORMAT_VERSION = 1
 
 
+def _project_rows_to_ball(w: torch.Tensor, k: float) -> torch.Tensor:
+    """Проекция строк в шар Пуанкаре радиуса sqrt((1-1e-5)/k) (F7 и ретракция)."""
+    max_radius = math.sqrt((1.0 - 1e-5) / k)
+    norm = torch.norm(w, p=2, dim=-1, keepdim=True)
+    return torch.where(norm > max_radius, w / norm * max_radius, w)
+
+
 class DiskSparseRiemannianAdam(Optimizer):
     """
     Disk-based Sparse Riemannian Adam (DSA).
 
     Специализированный оптимизатор для обучения сверхбольших графовых эмбеддингов.
-    - Хранит состояния (m, v) и веса (w) на NVMe через np.memmap.
+    - Хранит состояния (m, v), веса (w) и пер-строчные счётчики шагов (t) на NVMe
+      через np.memmap.
     - Масштабирует использование памяти от размера батча O(B), а не графа O(N).
     - Реализует Riemannian Gradient Scaling и проекцию (Retraction) для шара Пуанкаре.
     - Использует фоновую асинхронную запись для устранения простоев GPU.
@@ -32,7 +40,9 @@ class DiskSparseRiemannianAdam(Optimizer):
     у писателя, без дрена очереди (F2); повторное открытие каталога состояния
     управляется явным `resume` и meta-файлами (F3);
     bias-коррекция Adam — по пер-строчному счётчику шага, а не по глобальному t
-    (F4); индексы сортируются перед IO (F5).
+    (F4); индексы сортируются перед IO (F5); чтение весов проецируется в шар (F7);
+    чекпоинты — save_checkpoint/load_checkpoint, state_dict() честно бросает
+    NotImplementedError (F8).
     """
 
     def __init__(self, params: Union[list, dict], lr=1e-3, beta1=0.9, beta2=0.999,
@@ -130,7 +140,9 @@ class DiskSparseRiemannianAdam(Optimizer):
         файл нулями до запрошенного размера (и молча отображает только начало
         слишком длинного), поэтому обрезанный при сбое диска/копирования файл
         без этой проверки открылся бы штатно: потерянные строки читались бы
-        как нули и тихо смешивались со старыми.
+        как нули и тихо смешивались со старыми. Та же проверка выполняется
+        в load_checkpoint (_verify_checkpoint_file); здесь — штатный путь
+        открытия с resume=True.
         """
         row_bytes = int(np.prod(shape)) * 4      # float32: w, m, v
         expected = {'w': row_bytes, 'm': row_bytes, 'v': row_bytes,
@@ -143,7 +155,7 @@ class DiskSparseRiemannianAdam(Optimizer):
                     f"{actual} байт, по форме {list(shape)} ожидается {exp} "
                     f"(состояние обрезано — сбой диска/копирования — либо файл "
                     f"чужой). resume=True невозможен: восстановите файл из "
-                    f"резервной копии/чекпоинта или переоткройте с "
+                    f"резервной копии/чекпоинта или переоткройтесь с "
                     f"resume=False (полная переинициализация).")
 
     def _write_fresh_state(self, name, shape, paths, param):
@@ -210,8 +222,10 @@ class DiskSparseRiemannianAdam(Optimizer):
             self._write_fresh_state(name, shape, paths, param)
             self._write_meta(meta_path, name, shape, paths)
 
+    # ─────────────────────────────── шаг ───────────────────────────────
+
     @torch.no_grad()
-    def step(self, updates: Dict[str, Tuple[torch.Tensor, torch.Tensor]], 
+    def step(self, updates: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
              current_k: Optional[Union[float, torch.Tensor]] = None):
         """
         updates: словарь {'param_name': (indices_tensor, grads_tensor)}
@@ -223,23 +237,25 @@ class DiskSparseRiemannianAdam(Optimizer):
         if len(state) == 0:
             state['step'] = 0
         state['step'] += 1
-        
+
         group = self.param_groups[0]
         lr = group['lr']
         beta1, beta2 = group['beta1'], group['beta2']
         eps = group['eps']
         weight_decay = group['weight_decay']
-        
-        k = current_k.item() if isinstance(current_k, torch.Tensor) else (current_k if current_k is not None else group['k'])
+
+        k = current_k.item() if isinstance(current_k, torch.Tensor) else (
+            current_k if current_k is not None else group['k'])
 
         for name, (indices, grads) in updates.items():
             if name not in self.state_files or indices.numel() == 0:
                 continue
-            
+
             # 1. Агрегация градиентов для дублирующихся индексов в батче
             if indices.numel() != torch.unique(indices).numel():
                 unique_idx, inv = torch.unique(indices, return_inverse=True)
-                agg_grads = torch.zeros((len(unique_idx), grads.shape[1]), device=grads.device, dtype=grads.dtype)
+                agg_grads = torch.zeros((len(unique_idx), grads.shape[1]),
+                                        device=grads.device, dtype=grads.dtype)
                 agg_grads.index_add_(0, inv, grads)
                 active_indices, active_grads = unique_idx, agg_grads
             else:
@@ -259,7 +275,7 @@ class DiskSparseRiemannianAdam(Optimizer):
             # непусто → ждём полной очистки очереди и только потом читаем.
             if self.writer.intersects_inflight(name, idx_np):
                 self.writer.wait_all_flushed()
-            
+
             # 2. Чтение из mmap в оперативную память (только нужные строки)
             w = torch.from_numpy(states['w'][idx_np].copy())
             m = torch.from_numpy(states['m'][idx_np].copy())
@@ -268,6 +284,11 @@ class DiskSparseRiemannianAdam(Optimizer):
             t_row = torch.from_numpy(
                 states['t'][idx_np].copy().astype('int64')) + 1
             g_euc = active_grads.cpu().float()
+
+            # F7: защита чтения — битый файл не должен расходить геометрию:
+            # прочитанные веса сразу проецируются в шар
+            if k > 1e-9:
+                w = _project_rows_to_ball(w, k)
 
             # 3. Riemannian Gradient Scaling (Poincaré Ball)
             if k > 1e-9:
@@ -300,20 +321,137 @@ class DiskSparseRiemannianAdam(Optimizer):
 
             # 5. Retraction (удержание на многообразии)
             if k > 1e-9:
-                w_norm = torch.norm(w, p=2, dim=-1, keepdim=True)
-                max_radius = math.sqrt((1.0 - 1e-5) / k)
-                w = torch.where(w_norm > max_radius, w / w_norm * max_radius, w)
+                w = _project_rows_to_ball(w, k)
 
             # 6. Передача на асинхронную фоновую запись (счётчик — вместе
             # с w/m/v, одной очередью, чтобы состояние осталось согласованным)
             self.writer.put_update(name, active_indices, w, m, v,
                                    t_row.to(torch.int32))
 
+    # ─────────────────────── чекпоинты (F8) ───────────────────────
+
+    def save_checkpoint(self, path: str) -> str:
+        """
+        Явный чекпоинт: дождаться записи всей очереди, flush всех файлов
+        состояния (w/m/v/t) и атомарно записать манифест путей в `path`.
+        Возвращает абсолютный путь манифеста.
+        """
+        path = os.path.abspath(path)
+        self.writer.wait_all_flushed()
+        param_base = self.param_groups[0]['params'][0]
+        with self.writer._lock:
+            manifest = {
+                'format': 'DSA_checkpoint',
+                'version': 1,
+                'saved_at': datetime.now().isoformat(timespec='seconds'),
+                'global_step': int(self.state[param_base].get('step', 0)),
+                'params': {},
+            }
+            for name in self.param_names:
+                files = {}
+                for suffix, mm in self.state_files[name].items():
+                    mm.flush()
+                    files[suffix] = self._paths[name][suffix]
+                manifest['params'][name] = {
+                    'shape': list(self.state_files[name]['w'].shape),
+                    'files': files,
+                }
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        return path
+
+    def load_checkpoint(self, path: str) -> dict:
+        """
+        Восстановление из манифеста save_checkpoint. Файлы чекпоинта должны
+        лежать по тем же путям, на которых открыт оптимизатор (обычный сценарий:
+        создать DiskSparseRiemannianAdam(..., resume=True) на том же disk_dir и
+        вызвать load_checkpoint(манифест) для проверки целостности и переоткрытия
+        memmap). Чекпоинт из другого каталога не подхватывается молча — это
+        явная ошибка: скопируйте файлы в disk_dir и откройтесь с resume=True.
+        Проверяются существование файлов, их размеры и формы.
+        """
+        path = os.path.abspath(path)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"чекпоинт {path} не читается: {e!r}") from e
+        if manifest.get('format') != 'DSA_checkpoint':
+            raise RuntimeError(f"{path} не является чекпоинтом DSA "
+                               f"(format={manifest.get('format')!r})")
+
+        self.writer.wait_all_flushed()
+        new_files = {}
+        with self.writer._lock:
+            for name, param in zip(self.param_names, self.param_groups[0]['params']):
+                info = manifest['params'].get(name)
+                if info is None:
+                    raise RuntimeError(f"чекпоинт {path} не содержит параметр '{name}'")
+                shape = tuple(param.shape)
+                if tuple(info['shape']) != shape:
+                    raise RuntimeError(
+                        f"несовпадение формы для '{name}': чекпоинт "
+                        f"{list(info['shape'])}, оптимизатор {list(shape)}")
+                for suffix in ('w', 'm', 'v'):
+                    expected = int(np.prod(shape)) * 4  # float32
+                    self._verify_checkpoint_file(name, suffix, info, expected)
+                self._verify_checkpoint_file(name, 't', info, shape[0] * 4)  # int32
+
+                new_files[name] = {
+                    s: np.memmap(self._paths[name][s],
+                                 dtype='float32' if s != 't' else 'int32',
+                                 mode='r+',
+                                 shape=shape if s != 't' else (shape[0],))
+                    for s in ('w', 'm', 'v', 't')
+                }
+            self.state_files = new_files
+            self.writer.memmaps = {f"{n}_{s}": mm
+                                   for n, mm2 in new_files.items()
+                                   for s, mm in mm2.items()}
+        return manifest
+
+    def _verify_checkpoint_file(self, name, suffix, info, expected_bytes: int):
+        p = info['files'].get(suffix)
+        mine = os.path.abspath(self._paths[name][suffix])
+        if p is None:
+            raise RuntimeError(f"чекпоинт не содержит файл '{suffix}' для '{name}'")
+        if os.path.abspath(p) != mine:
+            raise RuntimeError(
+                f"чекпоинт ссылается на {p}, а оптимизатор открыт на {mine}: "
+                f"скопируйте файлы чекпоинта в disk_dir и создайте оптимизатор "
+                f"с resume=True")
+        if not os.path.exists(p):
+            raise RuntimeError(f"файл чекпоинта отсутствует: {p}")
+        actual = os.path.getsize(p)
+        if actual != expected_bytes:
+            raise RuntimeError(
+                f"файл {p}: размер {actual} байт, ожидалось {expected_bytes} "
+                f"— состояние повреждено")
+
+    # F8: молчаливо неверного state_dict не отдаём — только честная ошибка
+    def state_dict(self):
+        raise NotImplementedError(
+            "DSA хранит состояние на диске (файлы <name>_w/_m/_v/_t.dat в "
+            f"{self.disk_dir}); сериализовать его через state_dict() нельзя. "
+            "Используйте save_checkpoint()/load_checkpoint() либо shutdown() "
+            "и повторное открытие с resume=True.")
+
+    def load_state_dict(self, state_dict):
+        raise NotImplementedError(
+            "DSA восстанавливается с диска: создайте оптимизатор с resume=True "
+            "на том же disk_dir (и при необходимости load_checkpoint()). "
+            "load_state_dict() не поддерживается.")
+
     def shutdown(self):
         """Вызывать в конце обучения для финализации записи на диск."""
         if hasattr(self, 'writer'):
             self.writer.shutdown()
-            
+
     def zero_grad(self, set_to_none: bool = False):
         """Заглушка для совместимости, так как мы работаем с явными градиентами."""
         pass
