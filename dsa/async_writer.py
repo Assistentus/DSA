@@ -22,6 +22,7 @@ class AsyncDiskWriter:
       в записи) по каждому имени параметра — только целочисленные индексы.
       ``intersects_inflight`` даёт оптимизатору дешёвую проверку пересечения,
       ``wait_all_flushed`` — полную очистку очереди.
+    - F5: индексы сортируются перед записью — локальность IO.
     """
 
     def __init__(self, memmaps: Dict[str, np.memmap], max_queue_size: int = 150,
@@ -86,17 +87,22 @@ class AsyncDiskWriter:
     # ─────────────────────────── запись ───────────────────────────
 
     def _apply_write(self, name: str, indices, w_np, m_np, v_np, t_np=None):
-        """Синхронная запись одного батча в memmap."""
+        """Синхронная запись одного батча в memmap (F5: с сортировкой индексов)."""
+        indices = np.asarray(indices)
+        order = np.argsort(indices)
+        indices = indices[order]
+        w_np, m_np, v_np = w_np[order], m_np[order], v_np[order]
+        t_sorted = None if t_np is None else np.asarray(t_np)[order]
         with self._lock:
             self.memmaps[f"{name}_w"][indices] = w_np
             self.memmaps[f"{name}_m"][indices] = m_np
             self.memmaps[f"{name}_v"][indices] = v_np
-            if t_np is not None:
+            if t_sorted is not None:
                 t_mm = self.memmaps.get(f"{name}_t")
                 if t_mm is None:
                     raise RuntimeError(
                         f"передан счётчик шага для '{name}', но memmap '{name}_t' не открыт")
-                t_mm[indices] = t_np
+                t_mm[indices] = t_sorted
 
     def _process_queue(self):
         """Цикл записи: работает параллельно с основным обучением."""

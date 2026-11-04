@@ -32,7 +32,7 @@ class DiskSparseRiemannianAdam(Optimizer):
     у писателя, без дрена очереди (F2); повторное открытие каталога состояния
     управляется явным `resume` и meta-файлами (F3);
     bias-коррекция Adam — по пер-строчному счётчику шага, а не по глобальному t
-    (F4).
+    (F4); индексы сортируются перед IO (F5).
     """
 
     def __init__(self, params: Union[list, dict], lr=1e-3, beta1=0.9, beta2=0.999,
@@ -244,6 +244,12 @@ class DiskSparseRiemannianAdam(Optimizer):
                 active_indices, active_grads = unique_idx, agg_grads
             else:
                 active_indices, active_grads = indices, grads
+
+            # F5: сортировка индексов — локальность и чтения, и записи
+            if active_indices.numel() > 1:
+                order = torch.argsort(active_indices)
+                active_indices = active_indices[order]
+                active_grads = active_grads[order]
 
             idx_np = active_indices.cpu().numpy()
             states = self.state_files[name]
