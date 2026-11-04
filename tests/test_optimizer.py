@@ -31,6 +31,9 @@ def test_dsa_euclidean_step():
         idx_np = batch_indices.numpy()
         
         for _ in range(5):
+            # дрен очереди писателя: иначе чтение гоняется с фоновой записью
+            # предыдущего шага (см. F2 в CHANGELOG.md)
+            optimizer.writer.wait_all_flushed()
             weights_np = optimizer.state_files["entity_emb"]["w"][idx_np].copy()
             current_weights = torch.from_numpy(weights_np).requires_grad_(True)
             loss = torch.mean(current_weights ** 2)
@@ -66,7 +69,8 @@ def test_dsa_hyperbolic_step():
         
         batch_indices = torch.tensor([5, 10, 15], dtype=torch.long)
         idx_np = batch_indices.numpy()
-        
+
+        optimizer.writer.wait_all_flushed()  # см. F2 в CHANGELOG.md
         weights_np = optimizer.state_files["entity_emb"]["w"][idx_np].copy()
         current_weights = torch.from_numpy(weights_np).requires_grad_(True)
         
