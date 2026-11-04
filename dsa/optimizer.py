@@ -16,6 +16,11 @@ logger = logging.getLogger("DSA")
 # Версия формата дискового состояния (meta-файлы). Несовпадение — явная ошибка.
 STATE_FORMAT_VERSION = 1
 
+# R3: отладочный режим: неизвестный ключ updates — исключение вместо warning.
+# Включается переменной окружения DSA_DEBUG=1 либо присвоением
+# dsa.optimizer.DEBUG = True.
+DEBUG = os.environ.get("DSA_DEBUG", "0") not in ("", "0")
+
 
 def _project_rows_to_ball(w: torch.Tensor, k: float) -> torch.Tensor:
     """Проекция строк в шар Пуанкаре радиуса sqrt((1-1e-5)/k) (F7 и ретракция)."""
@@ -42,7 +47,9 @@ class DiskSparseRiemannianAdam(Optimizer):
     bias-коррекция Adam — по пер-строчному счётчику шага, а не по глобальному t
     (F4); индексы сортируются перед IO (F5); чтение весов проецируется в шар (F7);
     чекпоинты — save_checkpoint/load_checkpoint, state_dict() честно бросает
-    NotImplementedError (F8).
+    NotImplementedError (F8). Дополнительно: не-конечные строки из битого файла
+    обрабатываются на чтении (R1), переинициализация помечается маркером в meta
+    (R2), неизвестные ключи updates дают warning со счётчиком (R3).
     """
 
     def __init__(self, params: Union[list, dict], lr=1e-3, beta1=0.9, beta2=0.999,
@@ -67,6 +74,9 @@ class DiskSparseRiemannianAdam(Optimizer):
 
         self.state_files = {}
         self._paths = {}
+        # R1/R3: счётчики диагностики (не-конечные строки, неизвестные ключи)
+        self._nan_rows_replaced = 0
+        self._unknown_key_warnings = 0
 
         # ── Инициализация/валидация хранилища на диске (F3) ──────────────────
         for name, param in zip(self.param_names, self.param_groups[0]['params']):
@@ -99,7 +109,8 @@ class DiskSparseRiemannianAdam(Optimizer):
 
     # ─────────────────────── дисковое состояние (F3) ───────────────────────
 
-    def _write_meta(self, meta_path: str, name: str, shape, paths: dict):
+    def _write_meta(self, meta_path: str, name: str, shape, paths: dict,
+                    reinit_in_progress: bool = False):
         meta = {
             'format_version': STATE_FORMAT_VERSION,
             'param_name': name,
@@ -109,6 +120,9 @@ class DiskSparseRiemannianAdam(Optimizer):
             'files': {s: os.path.basename(p) for s, p in paths.items()},
             'updated': datetime.now().isoformat(timespec='seconds'),
         }
+        if reinit_in_progress:
+            # R2: маркер незавершённой переинициализации
+            meta['reinit_in_progress'] = True
         tmp = meta_path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -191,6 +205,24 @@ class DiskSparseRiemannianAdam(Optimizer):
                 f"восстановите все файлы ({', '.join(paths.values())}).")
 
         meta = self._load_meta(meta_path, name)
+        if meta.get('reinit_in_progress'):
+            # R2: процесс умер посреди переинициализации — часть файлов уже
+            # перезаписана, часть осталась от старого состояния. Принимать
+            # такое молча нельзя: resume=True — явная ошибка, resume=False —
+            # штатное восстановление полной переинициализацией.
+            if resume:
+                raise RuntimeError(
+                    f"meta-файл {meta_path}: состояние помечено "
+                    f"'reinit_in_progress' — предыдущая переинициализация не "
+                    f"завершилась (сбой процесса между записью файлов и meta), "
+                    f"файлы могут быть смешанными. resume=True невозможен: "
+                    f"удалите {self.disk_dir} целиком или переоткройте с "
+                    f"resume=False — полная переинициализация пересоздаст "
+                    f"файлы и снимет маркер.")
+            logger.warning(
+                f"DSA '{name}': предыдущая переинициализация не завершилась "
+                f"(маркер 'reinit_in_progress'); resume=False → полная "
+                f"переинициализация, маркер будет снят.")
         disk_shape = tuple(meta.get('shape', []))
         if disk_shape != tuple(shape):
             raise RuntimeError(
@@ -219,6 +251,11 @@ class DiskSparseRiemannianAdam(Optimizer):
                 f"DSA '{name}': в {self.disk_dir} найдено состояние {list(shape)}; "
                 f"resume=False → полная переинициализация: w берётся из params, "
                 f"m=v=0, счётчики шагов сброшены в 0.")
+            # R2: маркер ставится ДО перезаписи файлов и снимается финальной
+            # записью meta — смерть процесса посреди переинициализации не
+            # оставит смешанное состояние, выглядящее как валидное
+            self._write_meta(meta_path, name, shape, paths,
+                             reinit_in_progress=True)
             self._write_fresh_state(name, shape, paths, param)
             self._write_meta(meta_path, name, shape, paths)
 
@@ -248,7 +285,19 @@ class DiskSparseRiemannianAdam(Optimizer):
             current_k if current_k is not None else group['k'])
 
         for name, (indices, grads) in updates.items():
-            if name not in self.state_files or indices.numel() == 0:
+            if name not in self.state_files:
+                # R3: молча отброшенное обновление — потерянные данные без
+                # сообщения. Warning со счётчиком; в отладочном режиме —
+                # исключение (счётчик не растёт: warning не выдавался).
+                msg = (f"step(updates): неизвестный ключ '{name}' — обновление "
+                       f"пропущено (известные ключи: {sorted(self.state_files)}); "
+                       f"вероятна опечатка в имени параметра")
+                if DEBUG:
+                    raise KeyError(msg)
+                self._unknown_key_warnings += 1
+                logger.warning(msg)
+                continue
+            if indices.numel() == 0:
                 continue
 
             # 1. Агрегация градиентов для дублирующихся индексов в батче
@@ -284,6 +333,23 @@ class DiskSparseRiemannianAdam(Optimizer):
             t_row = torch.from_numpy(
                 states['t'][idx_np].copy().astype('int64')) + 1
             g_euc = active_grads.cpu().float()
+
+            # R1: не-конечные строки из битого файла не проходят молча:
+            # torch.where(norm > max) при NaN даёт False, и NaN расползся бы
+            # в m/v и далее в обучение. Строка обнуляется (как у свежей строки),
+            # проекция в шар ниже удерживает геометрию.
+            bad = torch.nonzero(
+                ~(torch.isfinite(w).all(dim=-1) & torch.isfinite(m).all(dim=-1)
+                  & torch.isfinite(v).all(dim=-1))).flatten()
+            if bad.numel() > 0:
+                self._nan_rows_replaced += int(bad.numel())
+                logger.warning(
+                    f"DSA '{name}': {int(bad.numel())} строк с NaN/inf в файлах "
+                    f"состояния (строки диска {active_indices[bad][:10].tolist()}); "
+                    f"обнулены и спроецированы в шар")
+                w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+                m = torch.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0)
+                v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
             # F7: защита чтения — битый файл не должен расходить геометрию:
             # прочитанные веса сразу проецируются в шар
