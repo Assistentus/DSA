@@ -85,12 +85,18 @@ class AsyncDiskWriter:
 
     # ─────────────────────────── запись ───────────────────────────
 
-    def _apply_write(self, name: str, indices, w_np, m_np, v_np):
+    def _apply_write(self, name: str, indices, w_np, m_np, v_np, t_np=None):
         """Синхронная запись одного батча в memmap."""
         with self._lock:
             self.memmaps[f"{name}_w"][indices] = w_np
             self.memmaps[f"{name}_m"][indices] = m_np
             self.memmaps[f"{name}_v"][indices] = v_np
+            if t_np is not None:
+                t_mm = self.memmaps.get(f"{name}_t")
+                if t_mm is None:
+                    raise RuntimeError(
+                        f"передан счётчик шага для '{name}', но memmap '{name}_t' не открыт")
+                t_mm[indices] = t_np
 
     def _process_queue(self):
         """Цикл записи: работает параллельно с основным обучением."""
@@ -103,9 +109,9 @@ class AsyncDiskWriter:
                 self.queue.task_done()
                 break
 
-            name, indices, w_np, m_np, v_np = batch_data
+            name, indices, w_np, m_np, v_np, t_np = batch_data
             try:
-                self._apply_write(name, indices, w_np, m_np, v_np)
+                self._apply_write(name, indices, w_np, m_np, v_np, t_np)
             except Exception as e:
                 logger.error(f"❌ IO Error: {e}")
             finally:
@@ -127,7 +133,7 @@ class AsyncDiskWriter:
                 except:
                     pass
 
-    def put_update(self, name: str, indices_pt, w_pt, m_pt, v_pt):
+    def put_update(self, name: str, indices_pt, w_pt, m_pt, v_pt, t_pt=None):
         """
         Подготовка данных для записи. Выполняется в потоке GPU.
 
@@ -139,6 +145,8 @@ class AsyncDiskWriter:
         w_np = w_pt.detach().cpu().numpy()
         m_np = m_pt.detach().cpu().numpy()
         v_np = v_pt.detach().cpu().numpy()
+        t_np = None if t_pt is None else np.asarray(
+            t_pt.detach().cpu().numpy(), dtype=np.int32)
 
         idx_set = set(int(i) for i in idx_np.tolist())
         # F2: помечаем строки «в полёте» до постановки в очередь — тогда между
@@ -146,7 +154,7 @@ class AsyncDiskWriter:
         with self._lock:
             self._inflight.setdefault(name, set()).update(idx_set)
         try:
-            self.queue.put((name, idx_np, w_np, m_np, v_np),
+            self.queue.put((name, idx_np, w_np, m_np, v_np, t_np),
                            timeout=self._put_timeout)
         except queue.Full:
             # F1: диск не успевает — пишем сами, синхронно, данные не теряем.
@@ -155,7 +163,7 @@ class AsyncDiskWriter:
                 f"⚠️ Очередь записи полна дольше {self._put_timeout:.1f} с "
                 f"('{name}', {len(idx_np)} строк): синхронная запись напрямую.")
             try:
-                self._apply_write(name, idx_np, w_np, m_np, v_np)
+                self._apply_write(name, idx_np, w_np, m_np, v_np, t_np)
             finally:
                 # строки записаны синхронно — из полёта их снимаем
                 with self._lock:

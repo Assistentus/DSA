@@ -30,7 +30,9 @@ class DiskSparseRiemannianAdam(Optimizer):
     Гарантии корректности (см. CHANGELOG.md): записи никогда не выбрасываются
     при полной очереди (F1); step() не читает строки, находящиеся в полёте
     у писателя, без дрена очереди (F2); повторное открытие каталога состояния
-    управляется явным `resume` и meta-файлами (F3).
+    управляется явным `resume` и meta-файлами (F3);
+    bias-коррекция Adam — по пер-строчному счётчику шага, а не по глобальному t
+    (F4).
     """
 
     def __init__(self, params: Union[list, dict], lr=1e-3, beta1=0.9, beta2=0.999,
@@ -63,6 +65,7 @@ class DiskSparseRiemannianAdam(Optimizer):
                 'w': os.path.join(self.disk_dir, f"{name}_w.dat"),
                 'm': os.path.join(self.disk_dir, f"{name}_m.dat"),
                 'v': os.path.join(self.disk_dir, f"{name}_v.dat"),
+                't': os.path.join(self.disk_dir, f"{name}_t.dat"),
             }
             meta_path = os.path.join(self.disk_dir, f"{name}_meta.json")
             self._init_param_storage(name, shape, paths, meta_path, param, resume)
@@ -72,12 +75,14 @@ class DiskSparseRiemannianAdam(Optimizer):
                 'w': np.memmap(paths['w'], dtype='float32', mode='r+', shape=shape),
                 'm': np.memmap(paths['m'], dtype='float32', mode='r+', shape=shape),
                 'v': np.memmap(paths['v'], dtype='float32', mode='r+', shape=shape),
+                # F4: пер-строчные счётчики шага, int32, N×4 байта
+                't': np.memmap(paths['t'], dtype='int32', mode='r+', shape=(shape[0],)),
             }
 
         # ── Запуск фонового писателя ─────────────────────────────────────────
         self.writer = AsyncDiskWriter(
             memmaps={f"{n}_{s}": self.state_files[n][s]
-                     for n in self.param_names for s in ['w', 'm', 'v']},
+                     for n in self.param_names for s in ['w', 'm', 'v', 't']},
             max_queue_size=max_queue_size,
             put_timeout=put_timeout,
         )
@@ -90,6 +95,7 @@ class DiskSparseRiemannianAdam(Optimizer):
             'param_name': name,
             'shape': list(shape),
             'dtype': 'float32',
+            'counter_dtype': 'int32',
             'files': {s: os.path.basename(p) for s, p in paths.items()},
             'updated': datetime.now().isoformat(timespec='seconds'),
         }
@@ -127,7 +133,8 @@ class DiskSparseRiemannianAdam(Optimizer):
         как нули и тихо смешивались со старыми.
         """
         row_bytes = int(np.prod(shape)) * 4      # float32: w, m, v
-        expected = {'w': row_bytes, 'm': row_bytes, 'v': row_bytes}
+        expected = {'w': row_bytes, 'm': row_bytes, 'v': row_bytes,
+                    't': int(shape[0]) * 4}      # int32: пер-строчные счётчики
         for suffix, exp in expected.items():
             actual = os.path.getsize(paths[suffix])
             if actual != exp:
@@ -140,7 +147,7 @@ class DiskSparseRiemannianAdam(Optimizer):
                     f"resume=False (полная переинициализация).")
 
     def _write_fresh_state(self, name, shape, paths, param):
-        """Полная (пере)инициализация: w из params, m=v=0, свежий meta."""
+        """Полная (пере)инициализация: w из params, m=v=0, счётчики 0, свежий meta."""
         for suffix in ('w', 'm', 'v'):
             mm = np.memmap(paths[suffix], dtype='float32', mode='w+', shape=shape)
             if suffix == 'w':
@@ -149,6 +156,10 @@ class DiskSparseRiemannianAdam(Optimizer):
                 mm[:] = 0.0
             mm.flush()
             del mm
+        t = np.memmap(paths['t'], dtype='int32', mode='w+', shape=(shape[0],))
+        t[:] = 0
+        t.flush()
+        del t
 
     def _init_param_storage(self, name, shape, paths, meta_path, param, resume: bool):
         exists = {s: os.path.exists(p) for s, p in paths.items()}
@@ -174,14 +185,15 @@ class DiskSparseRiemannianAdam(Optimizer):
                 f"несовпадение формы состояния DSA для '{name}': на диске "
                 f"{list(disk_shape)}, в параметрах {list(shape)}. Удалите "
                 f"{self.disk_dir} или укажите новый disk_dir.")
-        if meta.get('dtype') != 'float32':
+        if meta.get('dtype') != 'float32' or meta.get('counter_dtype') != 'int32':
             raise RuntimeError(
-                f"meta-файл {meta_path}: неожиданный тип данных "
-                f"(dtype={meta.get('dtype')!r}), ожидался float32.")
+                f"meta-файл {meta_path}: неожиданные типы данных "
+                f"(w/m/v={meta.get('dtype')!r}, t={meta.get('counter_dtype')!r}), "
+                f"ожидались float32/int32.")
 
         if resume:
             # Явное продолжение: существующее состояние используется как есть,
-            # w из params НЕ перезаписывает диск.
+            # w из params НЕ перезаписывает диск, счётчики шагов сохраняются.
             # До открытия memmap сверяем фактические размеры файлов: np.memmap
             # в режиме r+ молча продлевает обрезанный файл нулями (сбой диска
             # или копирования), и потерянные строки тихо смешались бы со
@@ -194,7 +206,7 @@ class DiskSparseRiemannianAdam(Optimizer):
             logger.warning(
                 f"DSA '{name}': в {self.disk_dir} найдено состояние {list(shape)}; "
                 f"resume=False → полная переинициализация: w берётся из params, "
-                f"m=v=0.")
+                f"m=v=0, счётчики шагов сброшены в 0.")
             self._write_fresh_state(name, shape, paths, param)
             self._write_meta(meta_path, name, shape, paths)
 
@@ -205,6 +217,7 @@ class DiskSparseRiemannianAdam(Optimizer):
         updates: словарь {'param_name': (indices_tensor, grads_tensor)}
         """
         # Глобальный счетчик шагов хранится в первом параметре для совместимости
+        # (в bias-коррекции он больше не участвует — она пер-строчная, F4)
         param_base = self.param_groups[0]['params'][0]
         state = self.state[param_base]
         if len(state) == 0:
@@ -216,9 +229,6 @@ class DiskSparseRiemannianAdam(Optimizer):
         beta1, beta2 = group['beta1'], group['beta2']
         eps = group['eps']
         weight_decay = group['weight_decay']
-        
-        bc1 = 1.0 - beta1 ** state['step']
-        bc2 = 1.0 - beta2 ** state['step']
         
         k = current_k.item() if isinstance(current_k, torch.Tensor) else (current_k if current_k is not None else group['k'])
 
@@ -248,6 +258,9 @@ class DiskSparseRiemannianAdam(Optimizer):
             w = torch.from_numpy(states['w'][idx_np].copy())
             m = torch.from_numpy(states['m'][idx_np].copy())
             v = torch.from_numpy(states['v'][idx_np].copy())
+            # F4: пер-строчный счётчик шага; +1 = этот шаг
+            t_row = torch.from_numpy(
+                states['t'][idx_np].copy().astype('int64')) + 1
             g_euc = active_grads.cpu().float()
 
             # 3. Riemannian Gradient Scaling (Poincaré Ball)
@@ -259,6 +272,13 @@ class DiskSparseRiemannianAdam(Optimizer):
                 g_riem = g_euc * rescale_factor
             else:
                 g_riem = g_euc
+
+            # F4: bias-коррекция по счётчику СТРОКИ, а не по глобальному шагу.
+            # Первый шаг свежей строки даёт lr*sign(g): m_hat=g, v_hat=g^2.
+            bc1 = (1.0 - torch.pow(torch.full_like(t_row, beta1, dtype=torch.float64),
+                                   t_row.double())).to(torch.float32).unsqueeze(-1)
+            bc2 = (1.0 - torch.pow(torch.full_like(t_row, beta2, dtype=torch.float64),
+                                   t_row.double())).to(torch.float32).unsqueeze(-1)
 
             # 4. Adam Step
             if weight_decay > 0:
@@ -278,8 +298,10 @@ class DiskSparseRiemannianAdam(Optimizer):
                 max_radius = math.sqrt((1.0 - 1e-5) / k)
                 w = torch.where(w_norm > max_radius, w / w_norm * max_radius, w)
 
-            # 6. Передача на асинхронную фоновую запись
-            self.writer.put_update(name, active_indices, w, m, v)
+            # 6. Передача на асинхронную фоновую запись (счётчик — вместе
+            # с w/m/v, одной очередью, чтобы состояние осталось согласованным)
+            self.writer.put_update(name, active_indices, w, m, v,
+                                   t_row.to(torch.int32))
 
     def shutdown(self):
         """Вызывать в конце обучения для финализации записи на диск."""
