@@ -13,7 +13,7 @@ class AsyncDiskWriter:
     Фоновый воркер для асинхронной записи обновлений на диск.
     Реализует Double Buffering: GPU вычисляет батч N+1, пока CPU пишет батч N.
 
-    Гарантии (исправления F1 и F2, см. CHANGELOG.md):
+    Гарантии (исправления по разбору дефектов, см. CHANGELOG.md):
 
     - F1: записи никогда не выбрасываются. Если очередь полна, ``put_update``
       блокируется на ``put_timeout`` секунд; если за это время место не освободилось,
@@ -23,6 +23,9 @@ class AsyncDiskWriter:
       ``intersects_inflight`` даёт оптимизатору дешёвую проверку пересечения,
       ``wait_all_flushed`` — полную очистку очереди.
     - F5: индексы сортируются перед записью — локальность IO.
+    - F6: ``shutdown`` дренирует очередь до конца, ждёт поток с достаточным
+      таймаутом и при невозможности дописать данные честно бросает ошибку.
+      Голых ``except: pass`` нет; все ошибки записи фиксируются и всплывают.
     """
 
     def __init__(self, memmaps: Dict[str, np.memmap], max_queue_size: int = 150,
@@ -34,8 +37,11 @@ class AsyncDiskWriter:
         self._put_timeout = float(put_timeout)
         # F2: строки в полёте, по имени параметра; защищено self._lock
         self._inflight: Dict[str, Set[int]] = {}
-        # F1: число синхронных fallback-записей мимо очереди (диагностика)
+        # F6: честный учёт ошибок вместо молчаливых потерь
+        self._write_errors = []
+        self._flush_errors = []
         self._sync_fallbacks = 0
+        self._stopped = False
 
         self.worker_thread = threading.Thread(
             target=self._process_queue, name="DSA_AsyncWriter", daemon=True)
@@ -118,8 +124,10 @@ class AsyncDiskWriter:
             name, indices, w_np, m_np, v_np, t_np = batch_data
             try:
                 self._apply_write(name, indices, w_np, m_np, v_np, t_np)
-            except Exception as e:
-                logger.error(f"❌ IO Error: {e}")
+            except Exception as e:  # F6: ошибка фиксируется и всплывёт на shutdown
+                msg = f"батч '{name}' ({len(indices)} строк) НЕ записан: {e!r}"
+                self._write_errors.append(msg)
+                logger.error("❌ IO Error: " + msg)
             finally:
                 # F2: строки этого батча больше не в полёте — до task_done,
                 # чтобы после queue.join() множество гарантированно было пустым
@@ -130,14 +138,16 @@ class AsyncDiskWriter:
                 self.queue.task_done()
 
     def _final_flush(self):
-        """Принудительная запись на диск перед выключением."""
+        """Принудительная запись на диск перед выключением (без голых except)."""
         logger.info("💾 AsyncDiskWriter: Финализация данных на диске...")
         with self._lock:
-            for mm in self.memmaps.values():
+            for key, mm in self.memmaps.items():
                 try:
                     mm.flush()
-                except:
-                    pass
+                except Exception as e:
+                    msg = f"flush {key} не выполнен: {e!r}"
+                    self._flush_errors.append(msg)
+                    logger.error("❌ " + msg)
 
     def put_update(self, name: str, indices_pt, w_pt, m_pt, v_pt, t_pt=None):
         """
@@ -146,6 +156,9 @@ class AsyncDiskWriter:
         F1: данные не теряются никогда. При полной очереди ждём место
         `put_timeout` секунд; не дождались — пишем синхронно напрямую.
         """
+        if self._stopped:
+            raise RuntimeError("AsyncDiskWriter уже остановлен: запись невозможна")
+
         # Переводим в Numpy на CPU. Это освобождает GPU тензоры немедленно.
         idx_np = np.asarray(indices_pt.detach().cpu().numpy())
         w_np = w_pt.detach().cpu().numpy()
@@ -175,22 +188,47 @@ class AsyncDiskWriter:
                 with self._lock:
                     self._inflight.setdefault(name, set()).difference_update(idx_set)
 
-    def shutdown(self, timeout: float = 5.0):
+    def shutdown(self, timeout: float = 300.0):
         """
-        Завершение работы:
+        Честное завершение работы (F6):
         1. Дописывает все оставшиеся батчи из очереди на диск.
-        2. Выполняет flush().
-        3. Завершает поток с таймаутом (защита от зависания msync в Linux/Kaggle).
+        2. Выполняет flush() всех memmap.
+        3. Ждёт завершения потока с достаточным таймаутом.
+
+        Если за `timeout` данные дописать не удалось, либо за сессию были
+        ошибки записи/flush — бросает RuntimeError. «Всё записано» сообщается
+        только когда это правда.
         """
-        logger.info("⏳ AsyncDiskWriter: Завершение операций и сброс на диск...")
+        if self._stopped:
+            return
+        self._stopped = True
+        logger.info("⏳ AsyncDiskWriter: Дренаж очереди и финальный сброс на диск...")
 
-        # 1. Отправляем сигнал остановки в очередь
+        # 1. Всё, что уже в очереди, будет записано (дрен тоже ограничен
+        #    таймаутом: застрявший диск — честная ошибка, а не вечное ожидание)
+        if not self._wait_queue_drained(timeout):
+            raise RuntimeError(
+                f"AsyncDiskWriter: за {timeout:.1f} с очередь не опустела "
+                f"(осталось батчей: {self.queue.unfinished_tasks}) — "
+                f"данные НЕ дописаны на диск")
+        # 2. Сигнал остановки: воркер сделает финальный flush и выйдет
+        #    (после дрена очередь пуста, put не блокируется)
         self.queue.put(self._stop_signal)
-
-        # 2. Ждем завершения фонового потока не более timeout секунд
+        # 3. Ждём завершения фонового потока (финальный msync может быть долгим)
         self.worker_thread.join(timeout=timeout)
 
         if self.worker_thread.is_alive():
-            logger.warning("⚠️ AsyncDiskWriter: Время ожидания msync истекло, но все данные из очереди записаны.")
-        else:
-            logger.info("✅ AsyncDiskWriter: Все данные успешно сохранены на диск.")
+            raise RuntimeError(
+                f"AsyncDiskWriter: фоновый поток не завершился за {timeout:.1f} с — "
+                f"данные НЕ гарантированно записаны на диск")
+
+        problems = []
+        if self._flush_errors:
+            problems.append(f"ошибки финального flush: {len(self._flush_errors)}")
+        if self._write_errors:
+            problems.append(f"невыполненные записи за сессию: {len(self._write_errors)}")
+        if problems:
+            first = (self._flush_errors + self._write_errors)[0]
+            raise RuntimeError(
+                "AsyncDiskWriter: " + "; ".join(problems) + f"; пример: {first}")
+        logger.info("✅ AsyncDiskWriter: Все данные успешно сохранены на диск.")
