@@ -17,16 +17,19 @@
 
 ## 🚀 Key Features
 
-* **Near-Zero VRAM Overhead:** Optimizer momentum ($m$), variance ($v$), weights ($w$) and per-row step counters ($t$) reside on NVMe/SSD storage via `np.memmap`. Only active batch parameters $\mathcal{O}(B)$ are loaded into GPU memory.
+* **Near-Zero VRAM Overhead:** Optimizer momentum ($m$), variance ($v$), weights ($w$) and per-row step counters ($t$) reside on NVMe/SSD storage via `np.memmap`. Only active batch rows are loaded into RAM/VRAM. By default the optimizer **does not retain the source tensors** after initialization (`retain_params=False`): they are replaced by zero-length CPU placeholders, so a full embedding table cannot stay alive on the GPU through `param_groups`.
+* **True Riemannian Adam ($k > 0$):** The Euclidean gradient is converted to a Riemannian one, Adam's first moment lives in the tangent space and is parallel-transported after every step, the step is an **exponential map** (not a Euclidean subtraction followed by a clip), and the second moment is carried as a non-negative diagonal scale. The collection of $O(B)$ rows is computed in `float64`, which keeps the Möbius/gyration formulas stable near the boundary; storage remains `float32`. `k = 0` is standard Euclidean Adam.
 * **Lossless Async I/O:** A background worker thread with double-buffering (`AsyncDiskWriter`) flushes state updates to disk asynchronously without stalling GPU computations. A full write queue never drops batches: `put_update` waits up to `put_timeout` seconds, then writes the batch synchronously.
 * **Read Consistency:** The writer tracks in-flight rows; `step()` drains the queue before reading rows the writer has not finished writing, so no step ever computes from stale state.
 * **Per-Row Adam Bias Correction:** Each row carries its own step counter (`<name>_t.dat`), so the first update of a freshly touched row is a correct Adam step regardless of the global step count.
-* **Explicit State Lifecycle:** State directories are guarded by `<name>_meta.json` (shape, dtype, format version). `resume=True` continues existing state; `resume=False` (default) fully reinitializes with a warning; shape/dtype mismatches, partial or truncated state files raise explicit errors instead of being silently reused.
-* **Safe Duplicate Aggregation:** Automatically aggregates duplicate node/entity indices (hub nodes) appearing within the same batch via `torch.unique` and `index_add_`.
-* **Sorted Sequential I/O:** Batch indices are sorted after deduplication, so reads and writes hit the memmaps sequentially.
-* **Riemannian & Euclidean Support:** Supports Riemannian gradient scaling and Poincaré Ball retraction ($k > 0$) for Hyperbolic embeddings, as well as standard Euclidean Adam ($k = 0.0$). Rows read from disk are projected into the ball, so corrupted files cannot break the geometry.
-* **Honest Shutdown & Checkpoints:** `shutdown()` drains the queue and raises `RuntimeError` if data could not be fully written; `save_checkpoint`/`load_checkpoint` provide a consistent on-disk checkpoint API (`state_dict()` intentionally raises `NotImplementedError`).
-* **Cross-Platform:** Runs seamlessly on local Linux/Windows GPU machines, workstations, and cloud notebooks.
+* **Explicit State Lifecycle:** State directories are guarded by `<name>_meta.json` (shape, dtype, format version, curvature, algorithm) and a global `dsa_global_meta.json` (global step, curvature). `resume=None` (default) refuses to guess when a directory already exists: pass `resume=True` to continue or `resume=False` to reinitialize. Shape/dtype mismatches, partial or truncated state files raise explicit errors. 0.1.0/0.2.0 directories are migrated on `resume=True` (weights preserved; incompatible moments and counters reset).
+* **Ball Invariants:** Fresh hyperbolic weights are globally scaled to at most `init_max_norm_fraction` (default 0.5) of the ball radius, so `torch.randn` initialization does not start on the boundary. Rows read from disk are projected, resumed tables are revalidated, and `set_curvature()` reprojects the whole table when the ball changes.
+* **Safe Duplicate Aggregation & Sorted I/O:** Duplicate node/entity indices are summed; batch indices are sorted after deduplication so reads and writes hit the memmaps sequentially.
+* **Explicit Weight Decay Semantics:** `weight_decay_mode="l2"` (default) adds `wd * w` to the Euclidean gradient and is therefore the Riemannian gradient of $f + \tfrac{wd}{2}\|w\|^2$; in the Euclidean case it is classic Adam L2. `"decoupled"` adds `wd * w` to the tangent-space descent direction and reproduces AdamW exactly when `k = 0`.
+* **Portable Checkpoints:** `export_checkpoint(dir)` writes a self-contained directory (`checkpoint.json` + relative data files + SHA-256 checksums); `import_checkpoint(dir)` verifies and restores it, including the global step and curvature. Checkpoints can be moved between machines. `save_checkpoint`/`load_checkpoint` remain as directory-only aliases.
+* **Honest Shutdown:** `shutdown()` is a retryable state machine (`RUNNING → DRAINING → STOPPED`, or `FAILED`); it never reports success while the worker is alive or the queue is unfinished, and a failed write is re-raised instead of being hidden.
+* **Validated Inputs:** Negative/out-of-range indices, wrong gradient shapes, non-finite gradients, NaN/negative moment rows, `k = NaN/inf/negative`, and unknown update keys all have explicit, test-covered behavior.
+* **Cross-Platform:** Runs on local Linux/Windows GPU machines, workstations, and cloud notebooks.
 
 ---
 
@@ -34,20 +37,25 @@
 
 There is no fixed throughput number: DSA trades compute for memory, and its
 speed is bounded by your disk — expect optimizer-state I/O to be the
-bottleneck on large tables. The correctness guarantees added in 0.2.0
-(blocking writes instead of dropped batches, in-flight row tracking, a fourth
-per-row counter file, sorted indices) add roughly ~10% step-time overhead
-compared to 0.1.0. Measure on your own hardware before drawing conclusions.
+bottleneck on large tables. The 0.3.0 correctness work (blocking writes,
+in-flight row tracking, a fourth per-row counter file, sorted indices,
+float64 batch math) adds step-time overhead compared to 0.1.0; the float64
+part only touches the active batch, so on large tables it is usually small
+relative to disk I/O. Measure on your own hardware before drawing conclusions.
 
 What stays true at any scale:
 
 | Property | Since |
 | :--- | :--- |
 | Optimizer states reside on disk; VRAM footprint scales with batch size $\mathcal{O}(B)$ | 0.1.0 |
+| Source tensors are not retained by the optimizer | 0.3.0 |
 | Duplicate node aggregation within a batch | 0.1.0 |
 | No silently dropped update batches | 0.2.0 |
 | Step reads never race the background writer | 0.2.0 |
 | Correct bias correction for sparsely updated rows | 0.2.0 |
+| Full Riemannian Adam (exp map + parallel transport) | 0.3.0 |
+| Portable checkpoints with checksums | 0.3.0 |
+| Retryable, honest shutdown | 0.3.0 |
 
 ---
 
@@ -109,14 +117,10 @@ print("🚀 Starting local training loop...")
 # 4. Training Loop
 for epoch in range(1, 101):
     indices = torch.randint(0, num_entities, (batch_size,))
-    idx_np = indices.numpy()
-    
-    # Read current weights directly from DSA disk memmap
-    # (drain the write queue first so the read cannot race a pending write)
-    optimizer.writer.wait_all_flushed()
-    vec_np = optimizer.state_files["entity_emb"]["w"][idx_np].copy()
-    vec = torch.from_numpy(vec_np).to(device).requires_grad_(True)
-    
+
+    # Public read API: waits for in-flight writes and projects into the ball.
+    vec = optimizer.read_rows(indices).to(device).requires_grad_(True)
+
     # Compute Loss (MSE against target)
     target_vec = target_embeddings[indices].to(device)
     loss = torch.mean((vec - target_vec) ** 2)
@@ -186,14 +190,10 @@ print("🚀 Starting training on Kaggle...")
 # 4. Training Loop
 for epoch in range(1, 11):
     indices = torch.randint(0, num_entities, (batch_size,))
-    idx_np = indices.numpy()
-    
-    # Fetch weights from DSA disk cache
-    # (drain the write queue first so the read cannot race a pending write)
-    optimizer.writer.wait_all_flushed()
-    vec_np = optimizer.state_files["entity_emb"]["w"][idx_np].copy()
-    vec = torch.from_numpy(vec_np).to(device).requires_grad_(True)
-    
+
+    # Public read API (in-flight writes are drained, rows are projected).
+    vec = optimizer.read_rows(indices).to(device).requires_grad_(True)
+
     # Compute Loss
     loss = (vec ** 2).sum()
     loss.backward()
@@ -213,20 +213,64 @@ if os.path.exists(KAGGLE_CACHE_DIR):
 
 ## 🌌 3. Hyperbolic Poincaré Ball Workflow ($k > 0$)
 
-For Hyperbolic Knowledge Graph Embeddings (e.g., Poincaré embeddings, RotatE in hyperbolic space), set the curvature parameter `k > 0.0`:
+For hyperbolic knowledge-graph embeddings, set `k > 0` (the ball has curvature
+$-k$ and radius $1/\sqrt{k}$):
 
 ```python
-# Set k=1.0 for Poincaré Ball Conformal Gradient Scaling & Retraction
+from dsa.optimizer import DiskSparseRiemannianAdam
+
 optimizer = DiskSparseRiemannianAdam(
     params={"hyperbolic_nodes": initial_weights},
-    lr=0.001,
-    k=1.0,  # Hyperbolic mode
-    disk_dir="./hyperbolic_cache"
+    lr=1e-3,
+    k=1.0,                    # hyperbolic mode
+    disk_dir="./hyperbolic_cache",
+    resume=False,             # explicit: new run, reinitialize this directory
+    weight_decay=0.0,
+    weight_decay_mode="l2",   # classic Adam L2 in the Riemannian gradient
 )
 
-# The optimizer automatically applies Riemannian scaling and retraction during step()
-optimizer.step(updates={"hyperbolic_nodes": (indices, gradients)})
+for indices, gradients in batches:
+    optimizer.step(updates={"hyperbolic_nodes": (indices, gradients)})
+
+# Read embeddings for inference: projected into the ball, safe public API.
+emb = optimizer.read_rows(indices, name="hyperbolic_nodes")
+
+# Curvature annealing: the ball changes, so every row is reprojected.
+optimizer.set_curvature(0.5)
+
+# Portable, checksummed checkpoint (a directory, not a JSON file).
+optimizer.export_checkpoint("./checkpoints/run-001")
+optimizer.shutdown()
 ```
+
+What `step()` does when `k > 0`:
+
+1. Reads only the batch rows `(w, m, v, t)` from the memmaps.
+2. Converts the Euclidean gradient to the Riemannian one,
+   $\operatorname{grad}_R f = \lambda(w)^{-2} g_E$, with
+   $\lambda(w) = 2 / (1 - k\|w\|^2)$.
+3. Updates Adam's moments: $m$ is a tangent vector, $v$ is a non-negative
+   diagonal scale. The active rows are computed in `float64` for numerical
+   stability near the boundary.
+4. Takes a geodesic step with the exponential map
+   $w \leftarrow \exp_w(-\eta\, \hat m / (\sqrt{\hat v}+\epsilon))$.
+5. Transports $m$ (and the square root of $v$) from $T_w$ to $T_{w_{\text{new}}}$
+   by parallel transport, so the moments follow the new tangent space.
+6. Projects the result into the ball as a numerical guard and queues the
+   consistent row update.
+
+Notes:
+
+* `init_max_norm_fraction=0.5` (default) globally scales fresh hyperbolic
+  weights so that no row starts closer than half the radius to the boundary.
+  Pass `init_max_norm_fraction=1.0` if you want only strict projection.
+* `resume=True` restores the saved curvature; a differing constructor `k` is
+  ignored with a warning. Use `set_curvature()` to change it deliberately.
+* `current_k=...` on `step()` is a shortcut for `set_curvature()`; it
+  reprojects the whole table because the ball itself changes.
+* `weight_decay_mode="decoupled"` applies decay as a tangent-space term
+  (AdamW semantics when `k = 0`). `"l2"` is part of the gradient and is
+  therefore scaled by the Poincaré metric.
 
 ---
 
@@ -244,56 +288,73 @@ optimizer = DiskSparseRiemannianAdam(
     beta2=0.999,
     eps=1e-8,
     weight_decay=0.0,
+    weight_decay_mode="l2",      # "l2" | "decoupled"
     k=1.0,
     disk_dir="./disk_cache",
     max_queue_size=150,
-    resume=False,
-    put_timeout=5.0
+    resume=None,                 # None | True | False
+    put_timeout=5.0,
+    retain_params=False,
+    init_max_norm_fraction=0.5,
 )
 ```
 
 #### Parameters:
-* **`params`** (*dict* or *list*): Dictionary of `{"param_name": torch.Tensor}` or a list of tensors to optimize.
-* **`lr`** (*float*, optional): Learning rate (default: `1e-3`).
-* **`beta1`, `beta2`** (*float*, optional): Coefficients for computing running averages of the gradient and its square (default: `0.9`, `0.999`).
-* **`eps`** (*float*, optional): Term added to the denominator for numerical stability (default: `1e-8`).
-* **`weight_decay`** (*float*, optional): Weight decay coefficient (default: `0.0`).
-* **`k`** (*float*, optional): Poincaré Ball curvature parameter ($k > 0$ for Hyperbolic, $k = 0$ for Euclidean) (default: `1.0`).
-* **`disk_dir`** (*str*, optional): Directory path where `np.memmap` files (`_w.dat`, `_m.dat`, `_v.dat`, `_t.dat`) and the `<name>_meta.json` descriptors will be created (default: `"./disk_cache"`).
-* **`max_queue_size`** (*int*, optional): Maximum capacity of the background I/O queue (default: `150`).
-* **`resume`** (*bool*, optional): `False` (default) — if state files already exist in `disk_dir`, they are fully reinitialized (weights from `params`, zeroed moments and counters) with a warning; `True` — continue from the existing state as is. Shape/dtype mismatch raises `RuntimeError` either way.
-* **`put_timeout`** (*float*, optional): Seconds to wait for queue space before a write batch falls back to a synchronous write (no data is ever dropped; default: `5.0`).
+* **`params`** (*dict* or *list*): `{name: tensor}` or a list of 2-D tensors. Values are read once to initialize the on-disk state.
+* **`lr`** (*float*): Learning rate (default `1e-3`).
+* **`beta1`, `beta2`** (*float*): Adam moment coefficients, each in `[0, 1)` (defaults `0.9`, `0.999`).
+* **`eps`** (*float*): Denominator floor, must be `> 0` (default `1e-8`).
+* **`weight_decay`** (*float*): Non-negative decay coefficient (default `0.0`).
+* **`weight_decay_mode`** (*str*): `"l2"` (default) puts `wd * w` into the Euclidean gradient before the Riemannian conversion; `"decoupled"` adds `wd * w` to the tangent descent direction (AdamW semantics when `k = 0`).
+* **`k`** (*float*): Curvature magnitude. `k > 0` is the Poincaré ball of curvature `-k`; `k = 0` is Euclidean Adam. Must be finite and non-negative; NaN/inf/negative raise immediately.
+* **`disk_dir`** (*str*): Directory for `<name>_w/_m/_v/_t.dat`, `<name>_meta.json`, and `dsa_global_meta.json`.
+* **`max_queue_size`** (*int*): Background write-queue capacity (default `150`).
+* **`resume`** (*None | bool*): `None` (default) raises if `disk_dir` already contains state, forcing an explicit choice; `True` continues it; `False` reinitializes from `params` with a warning. Legacy 0.1.0/0.2.0 state is migrated on `resume=True`.
+* **`put_timeout`** (*float*): Seconds to wait for queue space before a synchronous write (default `5.0`; writes are never dropped).
+* **`retain_params`** (*bool*): If `False` (default), the source tensors are replaced by zero-length CPU placeholders after initialization, so the optimizer cannot retain an $O(N)$ table in VRAM. Set `True` only if other code inspects `param_groups[...]["params"]`.
+* **`init_max_norm_fraction`** (*float*, `(0, 1]`): For `k > 0`, fresh weights whose largest row norm exceeds this fraction of the ball radius are globally scaled down (default `0.5`). `1.0` means strict projection only.
 
 #### Methods:
-* **`step(updates, current_k=None)`**: Performs a single optimization step. 
-  * `updates` (*dict*): Dictionary mapping `param_name` to a tuple `(indices_tensor, grads_tensor)`.
-  * `current_k` (*float* or *Tensor*, optional): Dynamic curvature $k$ override.
-* **`shutdown()`**: Drains pending writes, flushes all state files and terminates the background writer thread. Raises `RuntimeError` if the data could not be fully written. Must be called at the end of the training process.
-* **`save_checkpoint(path)`**: Writes a consistent checkpoint: drains the queue, flushes `w/m/v/t` and atomically stores a manifest with file paths and shapes.
-* **`load_checkpoint(path)`**: Verifies the manifest (shapes, paths, file sizes) and reopens the memmaps. Checkpoint files must live in the optimizer's `disk_dir`.
-* **`state_dict()` / `load_state_dict()`**: Raise `NotImplementedError` — DSA state lives on disk and cannot be serialized through these methods.
+* **`step(updates, current_k=None)`**: One optimizer step.
+  * `updates` (*dict*): `{param_name: (indices, grads)}`. Indices must be 1-D integer tensors/arrays in `[0, N)`; gradients must have shape `(len(indices), dim)` and be finite. Duplicate indices are summed.
+  * `current_k` (*float* or *Tensor*, optional): Change curvature for this and subsequent steps; the whole table is reprojected.
+* **`read_rows(indices, name=None)`**: Public read API for inference; waits for in-flight writes, validates indices, rejects corrupted rows, and projects into the current ball.
+* **`set_curvature(k, reset_moments=False)`**: Change curvature and reproject every row. Moments are kept by default (documented annealing approximation); `reset_moments=True` gives a mathematically clean restart of the adaptive state.
+* **`reproject_all(name=None)`**: Scan the whole table, project finite rows into the current ball, and fully reset non-finite/negative-variance rows. Returns the number of projected rows.
+* **`export_checkpoint(directory)`**: Write a portable checkpoint directory (`checkpoint.json`, relative data files, SHA-256 checksums) and return the manifest path.
+* **`import_checkpoint(directory, verify_hashes=True)`**: Verify and restore a portable checkpoint, including global step and curvature.
+* **`save_checkpoint(directory)` / `load_checkpoint(directory)`**: Directory-only aliases for the two methods above. Passing a `.json` path raises a clear migration error.
+* **`shutdown()`**: Drain the queue, flush state, and persist the global step. Retryable after a transient failure; raises while data is unfinished or a write failed. Call it at the end of training.
+* **`state_dict()` / `load_state_dict()`**: Raise `NotImplementedError` — use the checkpoint API or reopen the directory with `resume=True`.
+
+State files are an implementation detail; use `read_rows()` and checkpoints instead of reading `state_files` directly.
 
 ---
 
-## ⬆️ Upgrading from 0.1.0
+## ⬆️ Upgrading from 0.2.0 / 0.1.0
 
-0.2.0 keeps the public API (constructor, `step(updates, current_k)`, `shutdown()`, `state_files`) compatible; the new constructor arguments (`resume`, `put_timeout`) are optional. Behavior changes to be aware of:
+0.3.0 is a correctness release with several intentional breaking changes:
 
-* **`resume=False` is the default.** Re-running with default arguments fully reinitializes the state in `disk_dir` (weights from `params`, zeroed moments and per-row counters) and logs a warning. In 0.1.0, existing `_w/_m/_v.dat` files were silently reused. Pass `resume=True` to continue a previous run.
-* **Four state files per parameter** instead of three: a per-row step counter `<name>_t.dat` (int32) was added, plus a `<name>_meta.json` descriptor. Old 0.1.0 state directories are not compatible and must be removed (or reopened with the default `resume=False`, which reinitializes them).
-* **No dropped batches.** A full write queue blocks (up to `put_timeout` seconds) and then writes synchronously instead of discarding the batch.
-* **`shutdown()` can raise.** If pending data cannot be fully written, you get a `RuntimeError` with details instead of a false success message.
-* **`state_dict()`/`load_state_dict()` raise `NotImplementedError`.** Use `save_checkpoint()`/`load_checkpoint()` or reopen the directory with `resume=True`.
-* **Bias correction is per-row.** Rows that are updated rarely (or for the first time late in training) now get correct Adam bias correction; early-training dynamics differ from 0.1.0, which scaled by the global step counter.
+* **`resume` is now `None` by default.** An existing state directory is never reused or silently reinitialized: pass `resume=True` to continue or `resume=False` to start over.
+* **Checkpoints are directories.** `save_checkpoint`/`load_checkpoint` accept a directory; `export_checkpoint`/`import_checkpoint` are the primary names. 0.2.0 manifests with absolute paths are rejected — create a new checkpoint.
+* **State format v2.** 0.2.0 (`format_version=1`) and 0.1.0 (no meta, no `t`) directories are migrated on `resume=True`: weights are preserved, but moments and per-row counters are reset because 0.3.0 stores tangent-space moments and transports them. Re-running with `resume=False` reinitializes from `params` (this also repairs a partial 0.1.0 directory).
+* **The Riemannian step changed.** The old code was Adam in ambient coordinates with gradient scaling and a clip. 0.3.0 uses a Riemannian gradient, tangent-space moments, an exponential map and parallel transport. Hyperbolic training dynamics will differ from 0.2.0 even with the same hyperparameters.
+* **`weight_decay` semantics changed for `k > 0`.** The default `"l2"` is now part of the Riemannian gradient instead of a coordinate shrink; use `"decoupled"` if you need AdamW-style behavior.
+* **Source tensors are released.** `param_groups[...]["params"]` contains zero-length placeholders by default. Use `read_rows()` for weights. Pass `retain_params=True` for the old behavior.
+* **Global step is persisted.** `shutdown()` and checkpoints store it; reopening restores `_global_step` (bias correction remains per-row).
+* **Validation is strict.** Negative/out-of-range indices, wrong gradient shapes, non-finite gradients, invalid curvature, and unknown update keys now fail or warn explicitly instead of being ignored.
 
 ---
 
 ## 🛠️ Best Practices & Troubleshooting
 
-1. **Always call `optimizer.shutdown()`**: `shutdown()` drains the write queue and flushes all memory-mapped buffers. Since 0.2.0 it raises `RuntimeError` instead of silently pretending everything was saved.
-2. **Disk Space Limit**: Ensure your NVMe drive has enough space for 4 arrays per parameter (`_w.dat`, `_m.dat`, `_v.dat` float32 and `_t.dat` int32) plus a small `<name>_meta.json`. For 1M entities with 128 dimensions, this takes ~1.5 GB + 4 MB.
-3. **Queue Overflow Warning**: A full queue no longer drops batches: the write waits `put_timeout` seconds and then completes synchronously (a warning and the `writer._sync_fallbacks` counter are recorded). If this happens regularly, your disk is the bottleneck: increase `max_queue_size` or reduce the step rate.
-4. **Reopening a state directory** is controlled by `resume`: leftover files are never silently reused — you either continue explicitly (`resume=True`), reinitialize with a warning (`resume=False`, the default), or get a clear error (shape mismatch, partial or truncated files, missing meta).
+1. **Always call `optimizer.shutdown()`**: it drains the write queue, flushes all memmaps, persists the global step and stops the worker. It raises `RuntimeError` instead of pretending that unfinished data was saved; a second call retries after a transient failure.
+2. **Disk space.** Four arrays per parameter (`_w/_m/_v.dat` float32, `_t.dat` int32) plus two small JSON descriptors. For 1M entities with 128 dimensions this is ~1.5 GB + 4 MB.
+3. **Hyperbolic initialization.** Keep initial norms small. The default `init_max_norm_fraction=0.5` rescales a too-large table globally; a warning tells you when it happens. Starting at the boundary makes $\lambda^2$ huge and learning extremely slow.
+4. **Queue overflow.** A full queue waits `put_timeout` seconds and then writes synchronously (warning + `writer._sync_fallbacks`). If this happens regularly, your disk is the bottleneck: increase `max_queue_size` or reduce the step rate.
+5. **Reopening a state directory.** Use `resume=True` to continue, or `resume=False` to reinitialize. Shape mismatch, partial/truncated files, a missing meta file, a leftover reinitialization marker, or a curvature mismatch produce explicit errors.
+6. **Checkpoints.** Use a dedicated directory per checkpoint. Import verifies sizes and SHA-256 checksums; corrupted or foreign checkpoints are rejected before the live state is touched.
+7. **Boundary behavior.** Points are kept strictly inside the ball (`BALL_EPS = 1e-5`). Very long training with a large `lr` can push embeddings to that margin; the optimizer stays finite and projects, but the chart is ill-conditioned there. Prefer a smaller `lr` and early stopping rather than training on the boundary.
 
 ---
 
