@@ -319,6 +319,16 @@ class DiskSparseRiemannianAdam(Optimizer):
             raise RuntimeError(
                 f"глобальный meta-файл {path}: версия формата {version!r} "
                 f"не поддерживается (ожидается {STATE_FORMAT_VERSION})")
+        if "global_step" in meta:
+            try:
+                step = int(meta["global_step"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"глобальный meta-файл {path}: global_step="
+                    f"{meta['global_step']!r} не является целым") from exc
+            if step < 0:
+                raise RuntimeError(
+                    f"глобальный meta-файл {path}: global_step={step} < 0")
         return meta
 
     def _write_global_meta(self) -> str:

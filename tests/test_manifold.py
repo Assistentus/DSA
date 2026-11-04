@@ -138,3 +138,30 @@ def test_reference_satisfies_same_properties(points):
         reference._lambda(x, K).ravel() * np.linalg.norm(v, axis=-1),
         rtol=1e-12, atol=1e-12)
     assert np.allclose(reference.parallel_transport(y, x, pt, K), v, atol=1e-12)
+
+
+def test_euclidean_branches_are_identity(points):
+    """k=0 must reduce every geometry helper to its Euclidean counterpart."""
+    x, y, u, v = points
+    tx, ty, tu, tv = _torch(x), _torch(y), _torch(u), _torch(v)
+    assert torch.allclose(manifold.project_to_ball(tx, 0.0), tx)
+    assert np.allclose(manifold.project_to_ball_np(x, 0.0), x)
+    assert torch.allclose(manifold.mobius_add(tx, ty, 0.0), tx + ty)
+    assert torch.allclose(manifold.gyration(tx, ty, tv, 0.0), tv)
+    assert torch.allclose(manifold.expmap(tx, tu, 0.0), tx + tu)
+    assert torch.allclose(manifold.parallel_transport(tx, ty, tv, 0.0), tv)
+    assert torch.allclose(manifold.riemannian_gradient(tv, tx, 0.0), tv)
+    assert np.allclose(manifold.distance(tx, ty, 0.0).numpy(),
+                       np.linalg.norm(x - y, axis=-1))
+
+
+def test_is_in_ball_mask():
+    inside = torch.tensor([[0.0, 0.0], [0.5, 0.0]], dtype=torch.float64)
+    outside = torch.tensor([[2.0, 0.0]], dtype=torch.float64)
+    nan = torch.tensor([[float("nan"), 0.0]], dtype=torch.float64)
+    assert manifold.is_in_ball(inside, 1.0).tolist() == [True, True]
+    assert manifold.is_in_ball(outside, 1.0).tolist() == [False]
+    assert manifold.is_in_ball(nan, 1.0).tolist() == [False]
+    assert manifold.is_in_ball(outside, 0.0).tolist() == [True]
+    assert manifold.is_in_ball(nan, 0.0).tolist() == [False]
+
