@@ -4,18 +4,29 @@ The optimizer keeps ``w`` (weights), ``m`` (first moment), ``v`` (second
 moment) and a per-row step counter ``t`` in ``np.memmap`` files, so only the
 rows touched by a batch are read into RAM/VRAM.
 
-Hyperbolic mode (``k > 0``) implements the Riemannian Adam of Becigneul &
-Ganea (ICLR 2019) on the Poincare ball of curvature ``-k``:
+Hyperbolic mode (``k > 0``) is the Riemannian Adam of Becigneul & Ganea
+(ICLR 2019) on the Poincare ball of curvature ``-k``, matching geoopt's
+``RiemannianAdam`` on ``PoincareBallExact`` (verified step-by-step by
+tests):
 
 * the Euclidean gradient is converted to a Riemannian one at the current
   point (``lambda(x)^-2 g``);
-* Adam moments live in the tangent space at the current point;
-* the step is an exponential map, not a Euclidean subtraction plus clip;
-* after the step the moments are parallel-transported to the new tangent
-  space.
+* the first moment lives in the tangent space at the current point; the
+  second moment is the scalar squared Riemannian norm ``||g||_x^2``
+  (the paper's Algorithm 1; geoopt's ``component_inner`` - the ball is a
+  single manifold component), stored broadcast over coordinates;
+* the step is the exact exponential map, not a Euclidean subtraction plus
+  clip (geoopt's default ``PoincareBall`` uses a first-order retraction;
+  the ``Exact`` variant, like DSA, uses the exponential map);
+* after the step the first moment is parallel-transported to the new
+  tangent space (the paper's ``tau`` update); the scalar second moment
+  needs no transport.
 
-``k = 0`` is plain Euclidean Adam.  See ``README.md`` and ``CHANGELOG.md``
-for the exact semantics and the 0.3.0 migration notes.
+``k = 0`` is plain per-coordinate Euclidean Adam: ``R^d`` is the product
+of ``d`` manifold components, so the second moment stays per-coordinate,
+and the update equals ``torch.optim.Adam`` (``"l2"``) / ``torch.optim.AdamW``
+(``"decoupled"``) exactly. See ``README.md`` and ``CHANGELOG.md`` for the
+exact semantics and migration notes.
 """
 
 from __future__ import annotations
@@ -36,21 +47,26 @@ from .async_writer import AsyncDiskWriter
 from .manifold import (
     BALL_EPS,
     expmap,
+    lambda_x,
     parallel_transport,
     project_to_ball,
     project_to_ball_np,
     riemannian_gradient,
+    sq_norm,
 )
 
 logger = logging.getLogger("DSA")
 
 # Version of the per-parameter and global metadata formats.
-STATE_FORMAT_VERSION = 2
-LEGACY_STATE_FORMAT_VERSIONS = (1,)
+# v3: the second moment is the scalar ||g||_x^2 per row (paper Algorithm 1 /
+# geoopt component_inner); v2/v1 moments are incompatible and are reset on
+# migration (weights are preserved).
+STATE_FORMAT_VERSION = 3
+LEGACY_STATE_FORMAT_VERSIONS = (1, 2)
 ALGORITHM = "riemannian_adam"
 
 CHECKPOINT_FORMAT = "DSA_checkpoint"
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 CHECKPOINT_MANIFEST_NAME = "checkpoint.json"
 GLOBAL_META_NAME = "dsa_global_meta.json"
 
@@ -315,10 +331,11 @@ class DiskSparseRiemannianAdam(Optimizer):
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"глобальный meta-файл {path} не читается: {exc!r}") from exc
         version = int(meta.get("format_version", -1))
-        if version != STATE_FORMAT_VERSION:
+        if version != STATE_FORMAT_VERSION and version not in LEGACY_STATE_FORMAT_VERSIONS:
             raise RuntimeError(
                 f"глобальный meta-файл {path}: версия формата {version!r} "
-                f"не поддерживается (ожидается {STATE_FORMAT_VERSION})")
+                f"не поддерживается (ожидаются "
+                f"{list(LEGACY_STATE_FORMAT_VERSIONS) + [STATE_FORMAT_VERSION]})")
         if "global_step" in meta:
             try:
                 step = int(meta["global_step"])
@@ -409,6 +426,15 @@ class DiskSparseRiemannianAdam(Optimizer):
                 raise RuntimeError(
                     f"meta-файл {meta_path}: кривизна k={disk_k} не совпадает "
                     f"с k={self._current_k()}; смешивать геометрии нельзя.")
+        stored_mode = meta.get("weight_decay_mode")
+        if stored_mode is not None and stored_mode != self.param_groups[0]["weight_decay_mode"]:
+            logger.warning(
+                "meta-файл %s: состояние обучалось с weight_decay_mode=%r, "
+                "оптимизатор открыт с %r — семантика затухания весов меняется "
+                "с этого шага (l2 — часть градиента, decoupled — слагаемое "
+                "направления).",
+                meta_path, stored_mode,
+                self.param_groups[0]["weight_decay_mode"])
         files = meta.get("files") or {}
         for suffix, path in paths.items():
             expected = os.path.basename(path)
@@ -531,6 +557,16 @@ class DiskSparseRiemannianAdam(Optimizer):
                         f"несовпадение формы состояния DSA для '{name}': на "
                         f"диске {list(disk_shape)}, в параметрах {list(shape)}. "
                         f"Удалите {self.disk_dir} или укажите новый disk_dir.")
+            if any_data or meta is not None:
+                # R2: mark the transition BEFORE touching the data files.
+                # _write_fresh_state rewrites w/m/v/t one by one; a crash in
+                # the middle would leave a mixed state (some files new, some
+                # old) that the next resume=True cannot detect by size checks
+                # alone, because every file keeps its correct size.  With the
+                # marker, resume=True refuses and resume=False is the
+                # documented recovery (same rule as import_checkpoint).
+                self._write_meta(meta_path, name, shape, paths,
+                                 reinit_in_progress=True)
             self._write_fresh_state(name, shape, paths, param)
             self._write_meta(meta_path, name, shape, paths)
             return
@@ -577,15 +613,18 @@ class DiskSparseRiemannianAdam(Optimizer):
                 f"и снимет маркер.")
 
         self._verify_state_file_sizes(name, shape, paths)
-        if version == 1:
+        if version != STATE_FORMAT_VERSION:
+            # v1 (0.2.0): tangent moments without transport; v2 (0.3.0):
+            # per-coordinate second moment.  Both are incompatible with the
+            # current math - reset the moments/counters, keep the weights.
             logger.warning(
-                "DSA '%s': состояние 0.2.0 (format_version=1). Веса сохранены, "
-                "моменты m/v и счётчики t сброшены: 0.3.0 хранит моменты в "
-                "касательном пространстве и переносит их параллельно, старые "
-                "значения к новой математике неприменимы.", name)
+                "DSA '%s': состояние format_version=%s. Веса сохранены, "
+                "моменты m/v и счётчики t сброшены: семантика второго "
+                "момента изменилась, старые значения неприменимы.", name,
+                version)
             self._reset_moments(name, shape, paths)
             self._write_meta(meta_path, name, shape, paths,
-                             legacy_from=1, ball_validated=False)
+                             legacy_from=version, ball_validated=False)
         else:
             logger.info(
                 "DSA '%s': продолжаем состояние %s из %s (resume=True)",
@@ -813,20 +852,23 @@ class DiskSparseRiemannianAdam(Optimizer):
 
             # 4. A non-finite row cannot be repaired by projection: reset the
             # whole row (weights, moments, counter), so this step is a fresh
-            # Adam step (A4/R1).
+            # Adam step (A4/R1).  A negative counter is corruption too: bias
+            # correction 1 - beta**t turns negative, sqrt(v/bc2) becomes NaN
+            # and the step would die with a misleading "non-finite weights".
             finite = (torch.isfinite(w).all(dim=-1)
                       & torch.isfinite(m).all(dim=-1)
                       & torch.isfinite(v).all(dim=-1)
-                      & (v >= 0).all(dim=-1))
+                      & (v >= 0).all(dim=-1)
+                      & (t_prev >= 0))
             bad = ~finite
             if bool(bad.any()):
                 count = int(bad.sum())
                 self._nan_rows_replaced += count
                 logger.warning(
-                    "DSA '%s': %d строк с NaN/inf или отрицательной "
-                    "дисперсией в файлах состояния (строки диска %s); строка "
-                    "полностью сброшена (w=m=v=0, t=0).", name, count,
-                    idx[bad][:10].tolist())
+                    "DSA '%s': %d строк с NaN/inf, отрицательной дисперсией "
+                    "или битым счётчиком в файлах состояния (строки диска "
+                    "%s); строка полностью сброшена (w=m=v=0, t=0).", name,
+                    count, idx[bad][:10].tolist())
                 w[bad] = 0.0
                 m[bad] = 0.0
                 v[bad] = 0.0
@@ -850,13 +892,29 @@ class DiskSparseRiemannianAdam(Optimizer):
                 g_euc = g_euc + weight_decay * w
             g_riem = riemannian_gradient(g_euc, w, k)
 
-            # 7. Adam moments in the tangent space at w.
+            # 7. Adam moments in the tangent space at w.  The second moment
+            # follows the manifold's component structure (geoopt's
+            # component_inner, the paper's Algorithm 1): the Poincare ball is
+            # ONE manifold component, so v accumulates the scalar squared
+            # Riemannian norm ||g||_x^2 = lambda^2 ||g_riem||^2 broadcast over
+            # coordinates; the Euclidean R^d of the k=0 path is the product of
+            # d components, so v stays per-coordinate classic Adam.  The
+            # metric weighting keeps the Riemannian length of a first step
+            # bounded by lr*sqrt(dim) anywhere in the ball (plain chart
+            # components g^2 would grow as lambda(x)*lr near the boundary),
+            # and the scalar form is intrinsic - invariant under chart
+            # rotations, unlike a per-coordinate norm.
             t_new = t_prev + 1
             bc1 = (1.0 - beta1 ** t_new.double()).unsqueeze(-1)
             bc2 = (1.0 - beta2 ** t_new.double()).unsqueeze(-1)
 
             m.mul_(beta1).add_(g_riem, alpha=1.0 - beta1)
-            v.mul_(beta2).addcmul_(g_riem, g_riem, value=1.0 - beta2)
+            if k > 0.0:
+                lam = lambda_x(w, k)
+                v_update = (lam * lam) * sq_norm(g_riem)   # (B, 1), broadcast
+            else:
+                v_update = g_riem * g_riem
+            v.mul_(beta2).add_(v_update, alpha=1.0 - beta2)
             direction = (m / bc1) / (torch.sqrt(v / bc2) + eps)
 
             # 8. Decoupled decay is a tangent-space term, so in the Euclidean
@@ -865,18 +923,15 @@ class DiskSparseRiemannianAdam(Optimizer):
             if weight_decay > 0.0 and mode == "decoupled":
                 direction = direction + weight_decay * w
 
-            # 9. Exponential map + parallel transport of the moments.  The
-            # first moment is a tangent vector and is transported directly.
-            # The second moment is a diagonal (per-coordinate) accumulator;
-            # transporting it directly can rotate it into negative components,
-            # so its non-negative square root is transported and squared back
-            # (same scale, no NaNs).
+            # 9. Exponential map + parallel transport of the first moment (the
+            # paper's tau update).  The second moment is a scalar per row and
+            # needs no transport - scalars are invariant under tangent-space
+            # isometries (geoopt does not transport it either).
             if k > 0.0:
                 w_new = expmap(w, -lr * direction, k)
                 w_new = project_to_ball(w_new, k)
                 m_new = parallel_transport(w, w_new, m, k)
-                sqrt_v_new = parallel_transport(w, w_new, torch.sqrt(v), k)
-                v_new = sqrt_v_new.square()
+                v_new = v
             else:
                 w_new = w - lr * direction
                 m_new, v_new = m, v
@@ -1139,6 +1194,14 @@ class DiskSparseRiemannianAdam(Optimizer):
                 f"чекпоинт содержит параметры {sorted(saved_names)}, "
                 f"оптимизатор — {sorted(self.param_names)}")
         k = _validate_k(manifest.get("k"), where="k чекпоинта")
+        saved_mode = manifest.get("weight_decay_mode")
+        if saved_mode is not None and saved_mode != self.param_groups[0]["weight_decay_mode"]:
+            logger.warning(
+                "чекпоинт %s: состояние обучалось с weight_decay_mode=%r, "
+                "оптимизатор создан с %r — семантика затухания весов меняется "
+                "с этого шага.",
+                manifest_path, saved_mode,
+                self.param_groups[0]["weight_decay_mode"])
 
         self.writer.wait_all_flushed()
         staged: Dict[Tuple[str, str], str] = {}

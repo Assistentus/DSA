@@ -1,12 +1,15 @@
 """Independent float64 reference for Riemannian Adam on the Poincare ball.
 
 This module deliberately does not import :mod:`dsa.manifold`.  It implements
-the formulas from Becigneul & Ganea, "Riemannian Adaptive Optimization
-Methods" (ICLR 2019) and the standard Poincare-ball gyrovector formulas (the
-same conventions as geoopt with ``k_geoopt = -k``).  The tests first verify
-that this reference satisfies the defining geometric properties, then compare
-the optimizer against it, so the optimizer is not merely checked against a
-copy of itself.
+the standard Poincare-ball gyrovector formulas (the same conventions as
+geoopt with ``k_geoopt = -k``) and the optimizer variant used by DSA:
+per-coordinate moments (geoopt style, unlike the paper's scalar second
+moment), first-moment parallel transport (the paper's ``tau`` update) and a
+positivity-preserving sqrt-transport of the second moment (the paper needs
+no transport for its scalar ``v``; geoopt does not transport ``v`` at all).
+The tests first verify that this reference satisfies the defining geometric
+properties, then compare the optimizer against it, so the optimizer is not
+merely checked against a copy of itself.
 """
 
 from __future__ import annotations
@@ -109,11 +112,20 @@ class RiemannianAdamReference:
             g = g + self.wd * x
         if self.k > 0.0:
             g = g * (1.0 - self.k * _sq(x)) ** 2 / 4.0
+            # the ball is one manifold component: scalar squared Riemannian
+            # norm ||g||_x^2 = lambda^2 ||g_riem||^2, broadcast (the paper's
+            # Algorithm 1; geoopt's component_inner with keepdim)
+            g_sq = np.broadcast_to(
+                (_lambda(x, self.k) ** 2 * _sq(g)).reshape(len(x), 1),
+                g.shape,
+            )
+        else:
+            g_sq = g * g  # R^d is a product of d components: per-coordinate
 
         self.t[idx] += 1
         tt = self.t[idx].astype(np.float64)[:, None]
         m = self.b1 * self.m[idx] + (1.0 - self.b1) * g
-        v = self.b2 * self.v[idx] + (1.0 - self.b2) * g * g
+        v = self.b2 * self.v[idx] + (1.0 - self.b2) * g_sq
         direction = (m / (1.0 - self.b1 ** tt)) / (
             np.sqrt(v / (1.0 - self.b2 ** tt)) + self.eps)
         if self.wd > 0.0 and self.wd_mode == "decoupled":
@@ -122,8 +134,7 @@ class RiemannianAdamReference:
         if self.k > 0.0:
             x_new = expmap(x, -self.lr * direction, self.k)
             m = parallel_transport(x, x_new, m, self.k)
-            # Positive-preserving transport of the diagonal second moment.
-            v = parallel_transport(x, x_new, np.sqrt(v), self.k) ** 2
+            # the scalar second moment needs no transport
         else:
             x_new = x - self.lr * direction
 

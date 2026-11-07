@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.4.0 — 2026-11-07
+
+The full-verification pass: the optimizer is now checked against two
+independent external oracles and an end-to-end objective, and the second
+moment was brought to the paper's semantics.
+
+### Changed (mathematics)
+
+- **The second moment is the scalar squared Riemannian norm
+  `lambda(x)^2 * ||g_riem||^2` per row** (Algorithm 1 of Becigneul & Ganea;
+  geoopt's `component_inner` — the Poincare ball is a single manifold
+  component), stored broadcast over coordinates. In 0.3.x it was a
+  per-coordinate accumulator, which is (a) not intrinsic — it depends on the
+  chart's rotation — and (b) unbounded near the boundary: without the metric
+  weight the Riemannian length of a first step grows as `lambda(x) * lr`
+  instead of the bounded `lr * sqrt(dim)`. A scalar needs no parallel
+  transport, so the sqrt-transport heuristic of 0.3.x is gone: only the
+  first moment is transported (the paper's `tau` update). The Euclidean
+  path (k=0) keeps per-coordinate moments (R^d is a product of `d`
+  components) and remains exactly `torch.optim.Adam`/`AdamW`.
+- **State format v3, checkpoints v3.** v1/v2 moments are semantically
+  incompatible with the scalar second moment and are reset on migration
+  (weights preserved, `legacy_migrated_from` recorded); v2 states written
+  by 0.3.0 migrate with the same rule.
+
+### Verified against independent oracles
+
+- **geoopt 0.5.1** (`RiemannianAdam` on `PoincareBallExact`, the exact
+  exponential-map variant): the full multi-step trajectory — `w`, `m` and
+  `v` over 10 steps, k in {0.7, 1.0}, weight decay in {0, 0.02} — matches
+  to float32 rounding (~2e-7). `tests/test_geoopt_step.py`; runs whenever
+  geoopt is importable (install it into a separate directory and set
+  `PYTHONPATH`; skipped in CI). Near-boundary rows are not compared
+  directly: geoopt computes entirely in float32 and loses precision
+  catastrophically there; DSA's near-boundary behaviour is pinned by the
+  intrinsic invariant below and the stress test.
+- **torch.optim** (`tests/test_torch_equivalence.py`): k=0 dense 12-step
+  trajectories equal `torch.optim.Adam` ("l2") and `torch.optim.AdamW`
+  ("decoupled") within 2e-6.
+- **End-to-end descent** (`tests/test_optimization.py`): 300 steps minimise
+  the geodesic distance to fixed targets on the ball from ~1.5 to below
+  0.05 per row (gradients from torch.autograd through the verified
+  distance formula); a near-boundary stress test (rows at 0.9999 of the
+  radius, gradient scale 50, 60 steps) stays finite and inside the ball.
+- **Intrinsic invariant** (`test_h2_first_step_riemannian_length_is_bounded`):
+  the Riemannian length of a first step is at most `lr * sqrt(dim)` at any
+  point of the ball — the 0.3.x per-coordinate accumulator violated this
+  near the boundary by a factor of ~lambda.
+
+
+## 0.3.1 — 2026-11-07
+
+Audit follow-up: a line-by-line review of the 0.3.0 math and logic against
+the 0.2.0 baseline, Algorithm 1 of Becigneul & Ganea (ICLR 2019) and
+geoopt's `RiemannianAdam` implementation. Three behavior fixes (each with a
+regression test) and a documentation-accuracy fix.
+
+### Fixed
+
+- **R2 regression — a crash in the middle of a `resume=False`
+  reinitialisation left a mixed state that the next `resume=True` accepted
+  silently.** 0.2.0 marked the transition in meta; the 0.3.0 constructor
+  path dropped the marker (only `import_checkpoint` kept it), and since all
+  state files keep their correct size through a partial rewrite, size
+  verification cannot detect the mixture. The marker is now written before
+  the data files are touched whenever a reinitialisation runs over an
+  existing directory; `resume=True` refuses a marked state, `resume=False`
+  is the documented recovery and clears the marker. Covered by a
+  crash-simulation test (the write fails right after `w`).
+- **A corrupted negative per-row counter crashed `step()` with a misleading
+  error.** `t < 0` on disk (torn write) survived validation: bias correction
+  `1 - beta**t` turned negative, `sqrt(v/bc2)` produced NaN and the whole
+  step aborted with "non-finite weights; reduce lr" instead of the
+  documented A4 row reset. The counter is now part of the row-corruption
+  check: the row is fully reset (`w=m=v=0, t=0`) and the step proceeds as a
+  canonical first Adam step from the origin (pinned analytically).
+- **Silent weight-decay semantics switch.** `weight_decay_mode` is stored
+  in per-param meta and in checkpoints, but a mismatch with the constructor
+  argument was never reported: a state trained with `"l2"` could silently
+  continue with `"decoupled"`. `resume=True` and `import_checkpoint` now
+  log a warning naming both modes.
+
+### Documentation
+
+- The hyperbolic algorithm provenance is now stated precisely:
+  per-coordinate moments (geoopt style — the paper keeps `v` scalar),
+  first-moment transport (the paper's `tau` update), and a
+  positivity-preserving sqrt-transport of the second moment (the paper
+  needs no transport for scalar `v`; geoopt does not transport `v`).
+  The previous wording ("implements the Riemannian Adam of Becigneul &
+  Ganea", "the paper's operation") overstated the fidelity; the 0.3.0
+  known-limitation note was corrected accordingly.
+- The writer now documents that per-row write ordering is guaranteed
+  through `step()`; direct concurrent `put_update` calls with overlapping
+  rows can reorder writes.
+
+
 ## 0.3.0 — 2026-11-04
 
 Correctness release for hyperbolic training. The headline change is that
@@ -121,9 +218,9 @@ CUDA_VISIBLE_DEVICES="" python -m pytest -q
   chart itself is ill-conditioned there.
 - `v` is a per-coordinate diagonal moment. Transporting it directly as a
   tangent vector can produce negative components and NaNs, so its
-  non-negative square root is transported and squared back. This is the
-  positivity-preserving version of the paper's operation, not a
-  component-wise `sqrt` of a rotated vector.
+  non-negative square root is transported and squared back — a heuristic
+  that preserves the Riemannian scale of `sqrt(v)`. (Superseded in 0.4.0:
+  `v` is now the paper's scalar `||g||_x^2` and is not transported at all.)
 - CUDA-specific memory behavior is tested only through object lifetime on CPU
   in CI; no GPU is required for the test suite.
 
