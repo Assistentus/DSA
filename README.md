@@ -249,13 +249,15 @@ What `step()` does when `k > 0`:
 2. Converts the Euclidean gradient to the Riemannian one,
    $\operatorname{grad}_R f = \lambda(w)^{-2} g_E$, with
    $\lambda(w) = 2 / (1 - k\|w\|^2)$.
-3. Updates Adam's moments: $m$ is a tangent vector, $v$ is a non-negative
-   diagonal scale. The active rows are computed in `float64` for numerical
+3. Updates Adam's moments: $m$ is a tangent vector, $v$ is the scalar
+   squared Riemannian norm $\|g\|_x^2$ per row (stored broadcast over
+   coordinates — the ball is one manifold component, as in the paper and
+   geoopt). The active rows are computed in `float64` for numerical
    stability near the boundary.
 4. Takes a geodesic step with the exponential map
    $w \leftarrow \exp_w(-\eta\, \hat m / (\sqrt{\hat v}+\epsilon))$.
-5. Transports $m$ (and the square root of $v$) from $T_w$ to $T_{w_{\text{new}}}$
-   by parallel transport, so the moments follow the new tangent space.
+5. Transports $m$ from $T_w$ to $T_{w_{\text{new}}}$ by parallel transport
+   (the paper's $\tau$ update); the scalar $v$ needs no transport.
 6. Projects the result into the ball as a numerical guard and queues the
    consistent row update.
 

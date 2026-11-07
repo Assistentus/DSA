@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.0 — 2026-11-07
+
+The full-verification pass: the optimizer is now checked against two
+independent external oracles and an end-to-end objective, and the second
+moment was brought to the paper's semantics.
+
+### Changed (mathematics)
+
+- **The second moment is the scalar squared Riemannian norm
+  `lambda(x)^2 * ||g_riem||^2` per row** (Algorithm 1 of Becigneul & Ganea;
+  geoopt's `component_inner` — the Poincare ball is a single manifold
+  component), stored broadcast over coordinates. In 0.3.x it was a
+  per-coordinate accumulator, which is (a) not intrinsic — it depends on the
+  chart's rotation — and (b) unbounded near the boundary: without the metric
+  weight the Riemannian length of a first step grows as `lambda(x) * lr`
+  instead of the bounded `lr * sqrt(dim)`. A scalar needs no parallel
+  transport, so the sqrt-transport heuristic of 0.3.x is gone: only the
+  first moment is transported (the paper's `tau` update). The Euclidean
+  path (k=0) keeps per-coordinate moments (R^d is a product of `d`
+  components) and remains exactly `torch.optim.Adam`/`AdamW`.
+- **State format v3, checkpoints v3.** v1/v2 moments are semantically
+  incompatible with the scalar second moment and are reset on migration
+  (weights preserved, `legacy_migrated_from` recorded); v2 states written
+  by 0.3.0 migrate with the same rule.
+
+### Verified against independent oracles
+
+- **geoopt 0.5.1** (`RiemannianAdam` on `PoincareBallExact`, the exact
+  exponential-map variant): the full multi-step trajectory — `w`, `m` and
+  `v` over 10 steps, k in {0.7, 1.0}, weight decay in {0, 0.02} — matches
+  to float32 rounding (~2e-7). `tests/test_geoopt_step.py`; runs whenever
+  geoopt is importable (install it into a separate directory and set
+  `PYTHONPATH`; skipped in CI). Near-boundary rows are not compared
+  directly: geoopt computes entirely in float32 and loses precision
+  catastrophically there; DSA's near-boundary behaviour is pinned by the
+  intrinsic invariant below and the stress test.
+- **torch.optim** (`tests/test_torch_equivalence.py`): k=0 dense 12-step
+  trajectories equal `torch.optim.Adam` ("l2") and `torch.optim.AdamW`
+  ("decoupled") within 2e-6.
+- **End-to-end descent** (`tests/test_optimization.py`): 300 steps minimise
+  the geodesic distance to fixed targets on the ball from ~1.5 to below
+  0.05 per row (gradients from torch.autograd through the verified
+  distance formula); a near-boundary stress test (rows at 0.9999 of the
+  radius, gradient scale 50, 60 steps) stays finite and inside the ball.
+- **Intrinsic invariant** (`test_h2_first_step_riemannian_length_is_bounded`):
+  the Riemannian length of a first step is at most `lr * sqrt(dim)` at any
+  point of the ball — the 0.3.x per-coordinate accumulator violated this
+  near the boundary by a factor of ~lambda.
+
+
 ## 0.3.1 — 2026-11-07
 
 Audit follow-up: a line-by-line review of the 0.3.0 math and logic against
@@ -169,9 +219,8 @@ CUDA_VISIBLE_DEVICES="" python -m pytest -q
 - `v` is a per-coordinate diagonal moment. Transporting it directly as a
   tangent vector can produce negative components and NaNs, so its
   non-negative square root is transported and squared back — a heuristic
-  that preserves the Riemannian scale of `sqrt(v)`. (Corrected in 0.3.1:
-  this is *not* the paper's operation — Becigneul & Ganea keep `v` scalar,
-  so it needs no transport, and geoopt does not transport `v` at all.)
+  that preserves the Riemannian scale of `sqrt(v)`. (Superseded in 0.4.0:
+  `v` is now the paper's scalar `||g||_x^2` and is not transported at all.)
 - CUDA-specific memory behavior is tested only through object lifetime on CPU
   in CI; no GPU is required for the test suite.
 
