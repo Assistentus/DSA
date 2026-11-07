@@ -358,6 +358,55 @@ def test_f3_truncated_file_resume_false_reinits(tmp_path):
     opt2.shutdown()
 
 
+def test_r2_crash_mid_reinit_is_refused_on_resume(tmp_path, monkeypatch):
+    """kill -9 посреди resume=False переинициализации (дописан новый w, m/v/t
+    нет, meta старый валидный): размеры всех файлов совпадают, поэтому без
+    маркера resume=True принимает смешанное состояние молча. Маркер обязан
+    стоять ДО перезаписи файлов; resume=True отказывает, resume=False лечит."""
+    from dsa import optimizer as dsa_opt
+
+    n, d = 6, 3
+    opt = make_opt(str(tmp_path), np.full((n, d), 0.2), lr=0.05, k=0.0)
+    do_step(opt, [0, 1], np.ones((2, d)))
+    opt.shutdown()
+    meta_path = os.path.join(str(tmp_path), "ent_meta.json")
+
+    # имитация смерти процесса после записи w, но до m/v/t
+    def crash_after_w(self, name, shape, paths, param):
+        mm = np.memmap(paths["w"], dtype="float32", mode="w+", shape=shape)
+        mm[:] = np.full(shape, 0.9, dtype=np.float32)
+        mm.flush()
+        del mm
+        raise RuntimeError("имитация kill -9 посреди переинициализации")
+
+    monkeypatch.setattr(
+        dsa_opt.DiskSparseRiemannianAdam, "_write_fresh_state", crash_after_w)
+    with pytest.raises(RuntimeError, match="kill -9"):
+        make_opt(str(tmp_path), np.full((n, d), 0.3), lr=0.05, k=0.0,
+                 resume=False)
+    monkeypatch.undo()
+
+    # маркер в meta — свидетельство незавершённой переинициализации
+    with open(meta_path) as f:
+        meta = json.load(f)
+    assert meta.get("reinit_in_progress") is True, \
+        "переинициализация не помечена: смешанное состояние примут молча"
+
+    with pytest.raises(RuntimeError, match="reinit_in_progress"):
+        make_opt(str(tmp_path), np.full((n, d), 0.3), lr=0.05, k=0.0,
+                 resume=True)
+
+    # resume=False — документированный путь восстановления, маркер снимается
+    opt2 = make_opt(str(tmp_path), np.full((n, d), 0.25), lr=0.05, k=0.0,
+                    resume=False)
+    w, m, v, t = read_state(opt2)
+    assert np.allclose(w, 0.25, atol=1e-7)
+    assert np.all(m == 0) and np.all(v == 0) and np.all(t == 0)
+    with open(meta_path) as f:
+        assert "reinit_in_progress" not in json.load(f)
+    opt2.shutdown()
+
+
 # ───────────────────────── C1: legacy 0.1.0 / 0.2.0 ─────────────────────────
 
 def test_c1_legacy_010_resume_true_migrates(tmp_path):

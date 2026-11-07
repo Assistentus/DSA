@@ -531,6 +531,16 @@ class DiskSparseRiemannianAdam(Optimizer):
                         f"несовпадение формы состояния DSA для '{name}': на "
                         f"диске {list(disk_shape)}, в параметрах {list(shape)}. "
                         f"Удалите {self.disk_dir} или укажите новый disk_dir.")
+            if any_data or meta is not None:
+                # R2: mark the transition BEFORE touching the data files.
+                # _write_fresh_state rewrites w/m/v/t one by one; a crash in
+                # the middle would leave a mixed state (some files new, some
+                # old) that the next resume=True cannot detect by size checks
+                # alone, because every file keeps its correct size.  With the
+                # marker, resume=True refuses and resume=False is the
+                # documented recovery (same rule as import_checkpoint).
+                self._write_meta(meta_path, name, shape, paths,
+                                 reinit_in_progress=True)
             self._write_fresh_state(name, shape, paths, param)
             self._write_meta(meta_path, name, shape, paths)
             return
