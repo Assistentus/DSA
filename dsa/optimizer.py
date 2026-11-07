@@ -409,6 +409,15 @@ class DiskSparseRiemannianAdam(Optimizer):
                 raise RuntimeError(
                     f"meta-файл {meta_path}: кривизна k={disk_k} не совпадает "
                     f"с k={self._current_k()}; смешивать геометрии нельзя.")
+        stored_mode = meta.get("weight_decay_mode")
+        if stored_mode is not None and stored_mode != self.param_groups[0]["weight_decay_mode"]:
+            logger.warning(
+                "meta-файл %s: состояние обучалось с weight_decay_mode=%r, "
+                "оптимизатор открыт с %r — семантика затухания весов меняется "
+                "с этого шага (l2 — часть градиента, decoupled — слагаемое "
+                "направления).",
+                meta_path, stored_mode,
+                self.param_groups[0]["weight_decay_mode"])
         files = meta.get("files") or {}
         for suffix, path in paths.items():
             expected = os.path.basename(path)
@@ -1152,6 +1161,14 @@ class DiskSparseRiemannianAdam(Optimizer):
                 f"чекпоинт содержит параметры {sorted(saved_names)}, "
                 f"оптимизатор — {sorted(self.param_names)}")
         k = _validate_k(manifest.get("k"), where="k чекпоинта")
+        saved_mode = manifest.get("weight_decay_mode")
+        if saved_mode is not None and saved_mode != self.param_groups[0]["weight_decay_mode"]:
+            logger.warning(
+                "чекпоинт %s: состояние обучалось с weight_decay_mode=%r, "
+                "оптимизатор создан с %r — семантика затухания весов меняется "
+                "с этого шага.",
+                manifest_path, saved_mode,
+                self.param_groups[0]["weight_decay_mode"])
 
         self.writer.wait_all_flushed()
         staged: Dict[Tuple[str, str], str] = {}

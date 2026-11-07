@@ -576,6 +576,38 @@ def test_c4_invalid_weight_decay_mode(tmp_path):
         make_opt(str(tmp_path), np.zeros((3, 2)), weight_decay_mode="adamw")
 
 
+def test_c4_mode_switch_on_existing_state_warns(tmp_path, caplog):
+    """Режим затухания хранится в meta и в чекпоинте, но смена режима на живом
+    состоянии раньше проходила молча: состояние, обучавшееся с "l2", могло
+    тихо продолжиться с "decoupled". Оба пути обязаны предупредить."""
+    n, d = 6, 2
+    opt = make_opt(str(tmp_path), np.zeros((n, d)), lr=0.05, k=0.0,
+                   weight_decay=0.1, weight_decay_mode="l2")
+    do_step(opt, [0], np.ones((1, d)))
+    opt.shutdown()
+
+    # resume=True с другим режимом — предупреждение
+    with caplog.at_level(logging.WARNING, logger="DSA"):
+        opt2 = make_opt(str(tmp_path), np.zeros((n, d)), lr=0.05, k=0.0,
+                        weight_decay=0.1, weight_decay_mode="decoupled",
+                        resume=True)
+    assert any("weight_decay_mode" in r.message for r in caplog.records)
+    opt2.shutdown()
+
+    # импорт чекпоинта в оптимизатор с другим режимом — тоже предупреждение
+    caplog.clear()
+    opt3 = make_opt(str(tmp_path / "b"), np.zeros((n, d)), lr=0.05, k=0.0,
+                    weight_decay=0.1, weight_decay_mode="l2")
+    ckpt = opt3.export_checkpoint(str(tmp_path / "ck"))
+    opt3.shutdown()
+    opt4 = make_opt(str(tmp_path / "c"), np.zeros((n, d)), lr=0.05, k=0.0,
+                    weight_decay=0.1, weight_decay_mode="decoupled")
+    with caplog.at_level(logging.WARNING, logger="DSA"):
+        opt4.import_checkpoint(ckpt)
+    assert any("weight_decay_mode" in r.message for r in caplog.records)
+    opt4.shutdown()
+
+
 # ───────────────────────── F7 / H1: ball invariants ─────────────────────────
 
 def test_h1_init_is_scaled_into_ball(tmp_path):
@@ -951,7 +983,6 @@ def test_a4_zero_counter_discards_stale_moments(tmp_path):
     assert np.allclose(m[1], (1 - BETA1) * g[0], atol=1e-7)
     assert np.allclose(v[1], (1 - BETA2) * g[0] ** 2, atol=1e-7)
     assert t[1] == 1
-
 
 
 def test_a4_negative_counter_is_treated_as_corruption(tmp_path):
