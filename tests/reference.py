@@ -112,11 +112,20 @@ class RiemannianAdamReference:
             g = g + self.wd * x
         if self.k > 0.0:
             g = g * (1.0 - self.k * _sq(x)) ** 2 / 4.0
+            # the ball is one manifold component: scalar squared Riemannian
+            # norm ||g||_x^2 = lambda^2 ||g_riem||^2, broadcast (the paper's
+            # Algorithm 1; geoopt's component_inner with keepdim)
+            g_sq = np.broadcast_to(
+                (_lambda(x, self.k) ** 2 * _sq(g)).reshape(len(x), 1),
+                g.shape,
+            )
+        else:
+            g_sq = g * g  # R^d is a product of d components: per-coordinate
 
         self.t[idx] += 1
         tt = self.t[idx].astype(np.float64)[:, None]
         m = self.b1 * self.m[idx] + (1.0 - self.b1) * g
-        v = self.b2 * self.v[idx] + (1.0 - self.b2) * g * g
+        v = self.b2 * self.v[idx] + (1.0 - self.b2) * g_sq
         direction = (m / (1.0 - self.b1 ** tt)) / (
             np.sqrt(v / (1.0 - self.b2 ** tt)) + self.eps)
         if self.wd > 0.0 and self.wd_mode == "decoupled":
@@ -125,8 +134,7 @@ class RiemannianAdamReference:
         if self.k > 0.0:
             x_new = expmap(x, -self.lr * direction, self.k)
             m = parallel_transport(x, x_new, m, self.k)
-            # Positive-preserving transport of the diagonal second moment.
-            v = parallel_transport(x, x_new, np.sqrt(v), self.k) ** 2
+            # the scalar second moment needs no transport
         else:
             x_new = x - self.lr * direction
 

@@ -35,7 +35,8 @@ import pytest
 import torch
 
 from dsa import manifold
-from dsa.optimizer import DiskSparseRiemannianAdam
+from dsa.optimizer import (CHECKPOINT_VERSION, STATE_FORMAT_VERSION,
+                           DiskSparseRiemannianAdam)
 from tests.reference import RiemannianAdamReference, expmap
 
 BETA1, BETA2, EPS = 0.9, 0.999, 1e-8
@@ -221,7 +222,7 @@ def test_f3_meta_written_on_fresh_init(tmp_path):
     meta_path = os.path.join(str(tmp_path), "ent_meta.json")
     with open(meta_path) as f:
         meta = json.load(f)
-    assert meta["format_version"] == 2
+    assert meta["format_version"] == STATE_FORMAT_VERSION
     assert meta["algorithm"] == "riemannian_adam"
     assert meta["shape"] == [n, d]
     assert meta["dtype"] == "float32" and meta["counter_dtype"] == "int32"
@@ -421,7 +422,7 @@ def test_c1_legacy_010_resume_true_migrates(tmp_path):
     assert np.all(st[1] == 0) and np.all(st[2] == 0) and np.all(st[3] == 0)
     with open(os.path.join(str(tmp_path), "ent_meta.json")) as f:
         meta = json.load(f)
-    assert meta["format_version"] == 2
+    assert meta["format_version"] == STATE_FORMAT_VERSION
     assert meta["legacy_migrated_from"] == "0.1.0"
     opt.shutdown()
 
@@ -457,6 +458,47 @@ def test_c1_legacy_020_resets_incompatible_moments(tmp_path):
     assert np.all(st[1] == 0) and np.all(st[2] == 0) and np.all(st[3] == 0)
     with open(os.path.join(str(tmp_path), "ent_meta.json")) as f:
         assert json.load(f)["legacy_migrated_from"] == 1
+    opt.shutdown()
+
+
+def test_c1_legacy_030_resets_per_coordinate_moments(tmp_path, caplog):
+    """Состояние 0.3.0 (format_version=2, поэлементный второй момент):
+    семантика v изменилась на скалярную — моменты обязаны сброситься,
+    веса сохраниться, meta подняться до текущей версии."""
+    n, d = 4, 2
+    w = np.full((n, d), 0.03)
+    _write_legacy_010(str(tmp_path), w, np.full((n, d), 0.4),
+                      np.full((n, d), 0.5))
+    mm = np.memmap(os.path.join(str(tmp_path), "ent_t.dat"), dtype="int32",
+                   mode="w+", shape=(n,))
+    mm[:] = np.full(n, 9)
+    mm.flush()
+    del mm
+    meta = {
+        "format_version": 2,
+        "algorithm": "riemannian_adam",
+        "param_name": "ent",
+        "shape": list(w.shape),
+        "dtype": "float32",
+        "counter_dtype": "int32",
+        "k": 0.0,
+        "weight_decay_mode": "l2",
+        "files": {s: f"ent_{s}.dat" for s in ("w", "m", "v", "t")},
+        "ball_validated": True,
+    }
+    with open(os.path.join(str(tmp_path), "ent_meta.json"), "w") as f:
+        json.dump(meta, f)
+
+    with caplog.at_level(logging.WARNING, logger="DSA"):
+        opt = make_opt(str(tmp_path), np.zeros((n, d)), k=0.0, resume=True)
+    st = read_state(opt)
+    assert np.allclose(st[0], w, atol=1e-7), "веса 0.3.0 должны сохраниться"
+    assert np.all(st[1] == 0) and np.all(st[2] == 0) and np.all(st[3] == 0)
+    with open(os.path.join(str(tmp_path), "ent_meta.json")) as f:
+        migrated = json.load(f)
+    assert migrated["format_version"] == STATE_FORMAT_VERSION
+    assert migrated["legacy_migrated_from"] == 2
+    assert any("format_version=2" in r.message for r in caplog.records)
     opt.shutdown()
 
 
@@ -743,9 +785,10 @@ def test_h2_moments_are_transported_isometrically(tmp_path):
     lam1 = 2.0 / (1 - k * np.dot(w[0], w[0]))
     assert np.isclose(lam1 * np.linalg.norm(m[0]),
                       lam0 * np.linalg.norm(m_before), rtol=1e-5, atol=1e-7)
-    v_before = (1 - BETA2) * g_riem ** 2
-    assert np.isclose(lam1 ** 2 * np.sum(v[0]),
-                      lam0 ** 2 * np.sum(v_before), rtol=1e-5, atol=1e-9)
+    # v — скалярная норма на строку: (1-beta2)*lambda^2*||g_riem||^2, без
+    # переноса (скаляр инвариантен), размноженная по координатам
+    v_expected = (1 - BETA2) * lam0 ** 2 * np.dot(g_riem, g_riem)
+    assert np.allclose(v[0], v_expected, rtol=1e-5, atol=1e-9)
 
 
 def test_h2_first_step_from_origin_closed_form(tmp_path):
@@ -757,7 +800,11 @@ def test_h2_first_step_from_origin_closed_form(tmp_path):
     opt.shutdown()
     w, *_ = read_state(opt)
 
-    direction = g[0] / (np.abs(g[0]) + EPS)  # first Adam step at t=1
+    # Первый шаг из начала координат: g_riem = g/4, lambda(0) = 2; второй
+    # момент — скалярная норма ||g||_x^2, поэтому знаменатель — норма вектора:
+    # direction = g_riem / (lambda(0)*||g_riem|| + eps)
+    g_riem = g[0] / 4.0
+    direction = g_riem / (2.0 * np.linalg.norm(g_riem) + EPS)
     # exp_0(-lr * direction) = -tanh(sqrt(k)*lr*||direction||) /
     #                          (sqrt(k)*||direction||) * direction
     norm = np.linalg.norm(direction)
@@ -775,6 +822,43 @@ def test_h2_zero_gradient_is_identity(tmp_path):
     w, m, v, t = read_state(opt)
     assert np.allclose(w, w0, atol=1e-6)
     assert np.all(m == 0) and np.all(v == 0) and np.all(t == 1)
+
+
+def test_h2_first_step_riemannian_length_is_bounded(tmp_path):
+    """Семантика статьи/geoopt: риманова длина ПЕРВОГО шага ограничена
+    lr*sqrt(dim) в любой точке шара. Без метрического веса второго момента
+    длина растёт как lambda(x)*lr*sqrt(dim) — у границы шара это в тысячи раз
+    больше задуманного (строка «улетает» на противоположную сторону)."""
+    d, k, lr = 6, 1.0, 0.05
+    radius = math.sqrt((1 - manifold.BALL_EPS) / k)
+    # строки на разной глубине: центр, середина, вплотную к границе
+    norms = [0.0, 0.5 * radius, 0.9999 * radius]
+    w0 = []
+    for nrm in norms:
+        row = np.zeros(d)
+        row[0] = nrm
+        w0.append(row)
+    w0 = np.array(w0)
+    g = np.tile(np.array([1.0, -2.0, 0.5, 3.0, -1.0, 0.25]), (len(w0), 1))
+
+    opt = make_opt(str(tmp_path), w0, lr=lr, k=k)
+    w_before, *_ = read_state(opt)  # хранимые float32 значения
+    do_step(opt, np.arange(len(w0)), g)
+    opt.shutdown()
+    w, *_ = read_state(opt)
+
+    # допуск: 1e-4 относительный — запас на округление float32-хранения;
+    # старый (покоординатный, без метрики) вариант давал длину ~lambda*lr,
+    # у границы это в тысячи раз больше границы
+    bound = lr * math.sqrt(d) * (1.0 + 1e-4)
+    for i in range(len(w0)):
+        dist = manifold.distance(
+            torch.tensor(w_before[i], dtype=torch.float64),
+            torch.tensor(w[i], dtype=torch.float64), k).item()
+        assert dist <= bound, (
+            f"строка {i} (|w0|={norms[i]:.4f}): риманова длина шага {dist:.6f} "
+            f"превышает lr*sqrt(d)={bound:.6f} — второй момент без "
+            f"метрического веса?")
 
 
 # ───────────────────────── H3: curvature changes ─────────────────────────
@@ -1087,8 +1171,10 @@ def test_riemannian_gradient_scaling_formula(tmp_path):
     assert np.isclose(lam1 * np.linalg.norm(m[0]),
                       lam0 * np.linalg.norm((1 - BETA1) * g_riem),
                       rtol=1e-5, atol=1e-7)
-    expected = expmap(w0[0][None, :],
-                      -lr * np.sign(g_riem)[None, :], k)[0]
+    # скалярный второй момент: знаменатель — норма вектора, поэтому первый
+    # шаг идёт по -g_riem/||g_riem|| (единичное направление), не по sign
+    direction = g_riem / (lam0 * np.linalg.norm(g_riem) + EPS)
+    expected = expmap(w0[0][None, :], -lr * direction[None, :], k)[0]
     assert np.allclose(w[0], expected, atol=1e-6)
 
 
@@ -1160,7 +1246,7 @@ def test_c2_checkpoint_is_portable_and_self_contained(tmp_path):
     with open(manifest_path) as f:
         manifest = json.load(f)
     assert manifest["format"] == "DSA_checkpoint"
-    assert manifest["version"] == 2
+    assert manifest["version"] == CHECKPOINT_VERSION
     assert manifest["global_step"] == 2
     for info in manifest["params"].values():
         for rec in info["files"].values():
