@@ -823,20 +823,23 @@ class DiskSparseRiemannianAdam(Optimizer):
 
             # 4. A non-finite row cannot be repaired by projection: reset the
             # whole row (weights, moments, counter), so this step is a fresh
-            # Adam step (A4/R1).
+            # Adam step (A4/R1).  A negative counter is corruption too: bias
+            # correction 1 - beta**t turns negative, sqrt(v/bc2) becomes NaN
+            # and the step would die with a misleading "non-finite weights".
             finite = (torch.isfinite(w).all(dim=-1)
                       & torch.isfinite(m).all(dim=-1)
                       & torch.isfinite(v).all(dim=-1)
-                      & (v >= 0).all(dim=-1))
+                      & (v >= 0).all(dim=-1)
+                      & (t_prev >= 0))
             bad = ~finite
             if bool(bad.any()):
                 count = int(bad.sum())
                 self._nan_rows_replaced += count
                 logger.warning(
-                    "DSA '%s': %d строк с NaN/inf или отрицательной "
-                    "дисперсией в файлах состояния (строки диска %s); строка "
-                    "полностью сброшена (w=m=v=0, t=0).", name, count,
-                    idx[bad][:10].tolist())
+                    "DSA '%s': %d строк с NaN/inf, отрицательной дисперсией "
+                    "или битым счётчиком в файлах состояния (строки диска "
+                    "%s); строка полностью сброшена (w=m=v=0, t=0).", name,
+                    count, idx[bad][:10].tolist())
                 w[bad] = 0.0
                 m[bad] = 0.0
                 v[bad] = 0.0

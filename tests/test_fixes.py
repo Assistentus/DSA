@@ -953,6 +953,40 @@ def test_a4_zero_counter_discards_stale_moments(tmp_path):
     assert t[1] == 1
 
 
+
+def test_a4_negative_counter_is_treated_as_corruption(tmp_path):
+    """Битый отрицательный счётчик (torn write) — это порча строки, а не
+    «древняя» строка: 1 - beta**t < 0 даёт sqrt(отрицательного) = NaN, и шаг
+    падал с вводящим в заблуждение «не-конечные веса, уменьшите lr». Строка
+    обязана быть сброшена полностью, а шаг — дать канонический первый шаг."""
+    n, d = 5, 3
+    lr = 0.1
+    opt = make_opt(str(tmp_path), np.full((n, d), 0.1), lr=lr, k=0.0)
+    do_step(opt, [2], np.ones((1, d)))   # валидный шаг, чтобы состояние было живым
+    opt.shutdown()
+
+    # порча: t[0] = -7 (битый сектор / оборванная запись)
+    with open(os.path.join(str(tmp_path), "ent_t.dat"), "r+b") as f:
+        f.write(np.int32(-7).tobytes())
+
+    opt2 = make_opt(str(tmp_path), np.full((n, d), 0.1), lr=lr, k=0.0,
+                    resume=True)
+    g = np.full((1, d), 0.5)
+    do_step(opt2, [0], g)
+    opt2.shutdown()
+
+    w, m, v, t = read_state(opt2)
+    # строка полностью сброшена (w=0), поэтому первый шаг идёт от нуля:
+    # w = 0 - lr*g/(|g|+eps) — канонический первый шаг Adam
+    expected = -lr * g[0] / (np.abs(g[0]) + EPS)
+    assert np.allclose(w[0], expected, atol=1e-6), \
+        f"шаг по битой строке должен быть каноническим первым: {w[0]}"
+    assert t[0] == 1, f"счётчик должен перезапуститься с 1, получено {t[0]}"
+    assert np.isfinite(m[0]).all() and np.isfinite(v[0]).all()
+    assert opt2._nan_rows_replaced >= 1
+    assert t[2] == 1, "неповреждённая строка не должна быть тронута"
+
+
 def test_a4_nan_gradient_rejected(tmp_path):
     n, d = 4, 2
     opt = make_opt(str(tmp_path), np.zeros((n, d)), k=0.0)
