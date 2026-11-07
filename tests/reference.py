@@ -1,12 +1,15 @@
 """Independent float64 reference for Riemannian Adam on the Poincare ball.
 
 This module deliberately does not import :mod:`dsa.manifold`.  It implements
-the formulas from Becigneul & Ganea, "Riemannian Adaptive Optimization
-Methods" (ICLR 2019) and the standard Poincare-ball gyrovector formulas (the
-same conventions as geoopt with ``k_geoopt = -k``).  The tests first verify
-that this reference satisfies the defining geometric properties, then compare
-the optimizer against it, so the optimizer is not merely checked against a
-copy of itself.
+the standard Poincare-ball gyrovector formulas (the same conventions as
+geoopt with ``k_geoopt = -k``) and the optimizer variant used by DSA:
+per-coordinate moments (geoopt style, unlike the paper's scalar second
+moment), first-moment parallel transport (the paper's ``tau`` update) and a
+positivity-preserving sqrt-transport of the second moment (the paper needs
+no transport for its scalar ``v``; geoopt does not transport ``v`` at all).
+The tests first verify that this reference satisfies the defining geometric
+properties, then compare the optimizer against it, so the optimizer is not
+merely checked against a copy of itself.
 """
 
 from __future__ import annotations

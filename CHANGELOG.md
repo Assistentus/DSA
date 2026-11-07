@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.3.1 — 2026-11-07
+
+Audit follow-up: a line-by-line review of the 0.3.0 math and logic against
+the 0.2.0 baseline, Algorithm 1 of Becigneul & Ganea (ICLR 2019) and
+geoopt's `RiemannianAdam` implementation. Three behavior fixes (each with a
+regression test) and a documentation-accuracy fix.
+
+### Fixed
+
+- **R2 regression — a crash in the middle of a `resume=False`
+  reinitialisation left a mixed state that the next `resume=True` accepted
+  silently.** 0.2.0 marked the transition in meta; the 0.3.0 constructor
+  path dropped the marker (only `import_checkpoint` kept it), and since all
+  state files keep their correct size through a partial rewrite, size
+  verification cannot detect the mixture. The marker is now written before
+  the data files are touched whenever a reinitialisation runs over an
+  existing directory; `resume=True` refuses a marked state, `resume=False`
+  is the documented recovery and clears the marker. Covered by a
+  crash-simulation test (the write fails right after `w`).
+- **A corrupted negative per-row counter crashed `step()` with a misleading
+  error.** `t < 0` on disk (torn write) survived validation: bias correction
+  `1 - beta**t` turned negative, `sqrt(v/bc2)` produced NaN and the whole
+  step aborted with "non-finite weights; reduce lr" instead of the
+  documented A4 row reset. The counter is now part of the row-corruption
+  check: the row is fully reset (`w=m=v=0, t=0`) and the step proceeds as a
+  canonical first Adam step from the origin (pinned analytically).
+- **Silent weight-decay semantics switch.** `weight_decay_mode` is stored
+  in per-param meta and in checkpoints, but a mismatch with the constructor
+  argument was never reported: a state trained with `"l2"` could silently
+  continue with `"decoupled"`. `resume=True` and `import_checkpoint` now
+  log a warning naming both modes.
+
+### Documentation
+
+- The hyperbolic algorithm provenance is now stated precisely:
+  per-coordinate moments (geoopt style — the paper keeps `v` scalar),
+  first-moment transport (the paper's `tau` update), and a
+  positivity-preserving sqrt-transport of the second moment (the paper
+  needs no transport for scalar `v`; geoopt does not transport `v`).
+  The previous wording ("implements the Riemannian Adam of Becigneul &
+  Ganea", "the paper's operation") overstated the fidelity; the 0.3.0
+  known-limitation note was corrected accordingly.
+- The writer now documents that per-row write ordering is guaranteed
+  through `step()`; direct concurrent `put_update` calls with overlapping
+  rows can reorder writes.
+
+
 ## 0.3.0 — 2026-11-04
 
 Correctness release for hyperbolic training. The headline change is that
@@ -121,9 +168,10 @@ CUDA_VISIBLE_DEVICES="" python -m pytest -q
   chart itself is ill-conditioned there.
 - `v` is a per-coordinate diagonal moment. Transporting it directly as a
   tangent vector can produce negative components and NaNs, so its
-  non-negative square root is transported and squared back. This is the
-  positivity-preserving version of the paper's operation, not a
-  component-wise `sqrt` of a rotated vector.
+  non-negative square root is transported and squared back — a heuristic
+  that preserves the Riemannian scale of `sqrt(v)`. (Corrected in 0.3.1:
+  this is *not* the paper's operation — Becigneul & Ganea keep `v` scalar,
+  so it needs no transport, and geoopt does not transport `v` at all.)
 - CUDA-specific memory behavior is tested only through object lifetime on CPU
   in CI; no GPU is required for the test suite.
 

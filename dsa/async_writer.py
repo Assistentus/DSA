@@ -10,6 +10,12 @@ Guarantees (see CHANGELOG.md):
 * F6: ``shutdown`` is a state machine (``RUNNING -> DRAINING -> STOPPED``,
   or ``FAILED``) and is retryable: a transient failure (stuck disk, slow
   msync) does not turn a second call into a false success.
+
+Per-row write ordering is guaranteed through the optimizer's ``step()``,
+which checks the in-flight set before reading.  Direct concurrent
+``put_update`` calls with overlapping rows can reorder writes: the
+synchronous fallback writes at once while older batches may still be
+sitting in the queue.
 """
 
 from __future__ import annotations

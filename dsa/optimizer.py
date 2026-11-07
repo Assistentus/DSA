@@ -4,15 +4,22 @@ The optimizer keeps ``w`` (weights), ``m`` (first moment), ``v`` (second
 moment) and a per-row step counter ``t`` in ``np.memmap`` files, so only the
 rows touched by a batch are read into RAM/VRAM.
 
-Hyperbolic mode (``k > 0``) implements the Riemannian Adam of Becigneul &
-Ganea (ICLR 2019) on the Poincare ball of curvature ``-k``:
+Hyperbolic mode (``k > 0``) is a per-coordinate Riemannian Adam on the
+Poincare ball of curvature ``-k``, in the spirit of Becigneul & Ganea
+(ICLR 2019) and close in structure to geoopt's ``RiemannianAdam``:
 
 * the Euclidean gradient is converted to a Riemannian one at the current
   point (``lambda(x)^-2 g``);
-* Adam moments live in the tangent space at the current point;
+* the moments live in the tangent space at the current point and are kept
+  per coordinate (like geoopt; the paper keeps the second moment scalar -
+  the squared Riemannian norm of the gradient);
 * the step is an exponential map, not a Euclidean subtraction plus clip;
-* after the step the moments are parallel-transported to the new tangent
-  space.
+* after the step the first moment is parallel-transported to the new
+  tangent space (the paper's ``tau`` update); the second moment is
+  transported through its non-negative square root and squared back - a
+  positivity-preserving heuristic that keeps the Riemannian scale of
+  ``sqrt(v)``. (The paper needs no transport for its scalar ``v``;
+  geoopt does not transport ``v`` at all.)
 
 ``k = 0`` is plain Euclidean Adam.  See ``README.md`` and ``CHANGELOG.md``
 for the exact semantics and the 0.3.0 migration notes.
