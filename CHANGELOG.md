@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.0 — 2026-11-07
+
+First release after the `v1.0.0` tag (2026-07-10) and the first one
+where the in-code version matches the tag. Code-identical to 0.4.0:
+the number jump is versioning alignment with the release line, not a
+feature delta. The 0.2.0-0.4.0 entries below are the actual change
+history this release ships — the correctness overhaul (F1-F8, R1-R3),
+the full Riemannian Adam with portable checkpoints (C1-C5, A1-A4,
+H1-H4), the audit fixes (crash-safe reinitialisation, corrupted
+counters, weight-decay-mode warnings) and the scalar metric-weighted
+second moment, verified against independent oracles: multi-step
+trajectory equality with geoopt's `RiemannianAdam` on
+`PoincareBallExact` (~2e-7), exact equality with
+`torch.optim.Adam`/`AdamW` at `k=0`, end-to-end descent on a hyperbolic
+objective and near-boundary stress coverage.
+
+
 ## 0.4.0 — 2026-11-07
 
 The full-verification pass: the optimizer is now checked against two

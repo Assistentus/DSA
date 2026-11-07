@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsa"
-version = "0.4.0"
+version = "1.4.0"
 description = "Disk Sparse Adam (DSA): an out-of-core sparse Riemannian Adam optimizer for PyTorch"
 readme = "README.md"
 license = "MIT"

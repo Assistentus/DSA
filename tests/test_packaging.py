@@ -30,7 +30,7 @@ def test_version_matches_package():
         assert data["project"]["version"] == dsa.__version__
     else:  # pragma: no cover
         text = open(os.path.join(ROOT, "pyproject.toml")).read()
-        assert re.search(r'version\s*=\s*"0\.4\.0"', text)
+        assert re.search(r'version\s*=\s*"1\.4\.0"', text)
 
 
 def test_torch_floor_matches_readme_badge():
